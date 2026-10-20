@@ -3,15 +3,18 @@
 * gcc Kernel64Patcher.c -o Kernel64Patcher
 */
 
-#ifdef __gnu_linux__
-    #define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "patchfinder64.c"
+#include "watchos32.c"
 
 #define GET_OFFSET(kernel_len, x) (x - (uintptr_t) kernel_buf)
 
@@ -76,7 +79,7 @@ int get_SPUFirmwareValidation_patch(void *kernel_buf, size_t kernel_len) {
 int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kernel_len) {
     printf("%s: Entering ...\n",__FUNCTION__);
     char rootVPString[40] = "rootvp not authenticated after mounting";
-    char md0String[3] = "md0";
+    char md0String[] = "md0";
     void* ent_loc = memmem(kernel_buf,kernel_len,md0String,3);
     if(!ent_loc) {
         printf("%s: Could not find \"md0\" string\n",__FUNCTION__);
@@ -149,7 +152,7 @@ int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kerne
 int get_AMFIInitializeLocalSigningPublicKey_patch(void* kernel_buf,size_t kernel_len) {
     printf("%s: Entering ...\n",__FUNCTION__);
 
-    char AMFIString[52] = "\"AMFI: %s: unable to obtain local signing public key";
+    char AMFIString[] = "\"AMFI: %s: unable to obtain local signing public key";
     void* ent_loc = memmem(kernel_buf,kernel_len,AMFIString,51);
     if(!ent_loc) {
         printf("%s: Could not find \"AMFI: %%s: unable to obtain local signing public key\" string\n",__FUNCTION__);
@@ -294,8 +297,30 @@ int get_amfi_out_of_my_way_patch(void* kernel_buf,size_t kernel_len) {
     
     printf("%s: Entering ...\n",__FUNCTION__);
     
-    void* xnu = memmem(kernel_buf,kernel_len,"root:xnu-",9);
-    int kernel_vers = atoi(xnu+9);
+    const unsigned char *xnu = memmem(kernel_buf,kernel_len,"root:xnu-",9);
+    if (!xnu) {
+        fprintf(stderr, "Missing XNU version string.\n");
+        return -1;
+    }
+    const unsigned char *version = xnu + 9;
+    const unsigned char *end = (const unsigned char *)kernel_buf + kernel_len;
+    int kernel_vers = 0;
+    if (version == end || *version < '0' || *version > '9') {
+        fprintf(stderr, "Invalid XNU version string.\n");
+        return -1;
+    }
+    while (version < end && *version >= '0' && *version <= '9') {
+        int digit = *version++ - '0';
+        if (kernel_vers > (INT32_MAX - digit) / 10) {
+            fprintf(stderr, "Invalid XNU version string.\n");
+            return -1;
+        }
+        kernel_vers = kernel_vers * 10 + digit;
+    }
+    if (version == end) {
+        fprintf(stderr, "Invalid XNU version string.\n");
+        return -1;
+    }
     printf("%s: Kernel-%d inputted\n",__FUNCTION__, kernel_vers);
     char amfiString[33] = "entitlements too small";
     int stringLen = 22;
@@ -343,100 +368,165 @@ int get_amfi_out_of_my_way_patch(void* kernel_buf,size_t kernel_len) {
     return 0;
 }
 
+static void usage(const char *program) {
+    fprintf(stderr, "Usage: %s <kernel_in> <kernel_out> <args>\n", program);
+    fprintf(stderr, "\t-a\t\tPatch AMFI\n");
+    fprintf(stderr, "\t-f\t\tPatch AppleFirmwareUpdate img4 signature check\n");
+    fprintf(stderr, "\t-s\t\tPatch SPUFirmwareValidation (iOS 15 Only)\n");
+    fprintf(stderr, "\t-r\t\tPatch RootVPNotAuthenticatedAfterMounting (iOS 15 Only)\n");
+    fprintf(stderr, "\t-o\t\tPatch could_not_authenticate_personalized_root_hash (iOS 15 Only)\n");
+    fprintf(stderr, "\t-p\t\tPatch AMFIInitializeLocalSigningPublicKey (iOS 15 Only)\n");
+    fprintf(stderr, "  --dry-run  Validate and report without writing output\n");
+}
+
 int main(int argc, char **argv) {
-    
-    printf("%s: Starting...\n", __FUNCTION__);
-    
-    FILE* fp = NULL;
-    
-    if(argc < 4){
-        printf("Usage: %s <kernel_in> <kernel_out> <args>\n",argv[0]);
-        printf("\t-a\t\tPatch AMFI\n");
-        printf("\t-f\t\tPatch AppleFirmwareUpdate img4 signature check\n");
-        printf("\t-s\t\tPatch SPUFirmwareValidation (iOS 15 Only)\n");
-        printf("\t-r\t\tPatch RootVPNotAuthenticatedAfterMounting (iOS 15 Only)\n");
-        printf("\t-o\t\tPatch could_not_authenticate_personalized_root_hash (iOS 15 Only)\n");
-        printf("\t-p\t\tPatch AMFIInitializeLocalSigningPublicKey (iOS 15 Only)\n");
-        return 0;
-    }
-    
-    void* kernel_buf;
+    unsigned char *kernel_buf = NULL;
+    FILE *fp = NULL;
     size_t kernel_len;
-    
+    long length;
+    int flags = 0, dry_run = 0, result = 1;
+    struct stat in_stat, out_stat;
+    if (argc == 2 && !strcmp(argv[1], "--help")) { usage(argv[0]); return 0; }
+    if (argc < 4) { usage(argv[0]); return 1; }
+    for (int i = 3; i < argc; ++i) {
+        if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
+        else if (!strcmp(argv[i], "-a")) flags |= 1;
+        else if (!strcmp(argv[i], "-f")) flags |= 2;
+        else if (!strcmp(argv[i], "-s")) flags |= 4;
+        else if (!strcmp(argv[i], "-r")) flags |= 8;
+        else if (!strcmp(argv[i], "-o")) flags |= 16;
+        else if (!strcmp(argv[i], "-p")) flags |= 32;
+        else { fprintf(stderr, "Unknown flag: %s\n", argv[i]); return 1; }
+    }
+    if (!flags) { usage(argv[0]); return 1; }
+    printf("%s: Starting...\n", __FUNCTION__);
     fp = fopen(argv[1], "rb");
-    if(!fp) {
-        printf("%s: Error opening %s!\n", __FUNCTION__, argv[1]);
-        return -1;
+    if (!fp) { perror(argv[1]); return 1; }
+    if (fstat(fileno(fp), &in_stat) ||
+        fseek(fp, 0, SEEK_END) || (length = ftell(fp)) < 32 ||
+        fseek(fp, 0, SEEK_SET)) {
+        fprintf(stderr, "Cannot read a complete Mach-O header from input.\n");
+        goto cleanup;
     }
-    
-    fseek(fp, 0, SEEK_END);
-    kernel_len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    kernel_buf = (void*)malloc(kernel_len);
-    if(!kernel_buf) {
-        printf("%s: Out of memory!\n", __FUNCTION__);
-        fclose(fp);
-        return -1;
+    kernel_len = (size_t)length;
+    if (!stat(argv[2], &out_stat) && in_stat.st_dev == out_stat.st_dev &&
+        in_stat.st_ino == out_stat.st_ino) {
+        fprintf(stderr, "Input and output must be different files.\n");
+        goto cleanup;
     }
-    
-    fread(kernel_buf, 1, kernel_len, fp);
-    fclose(fp);
-    
-    if(memmem(kernel_buf,kernel_len,"KernelCacheBuilder",18)) {
-        printf("%s: Detected IMG4/IM4P, you have to unpack and decompress it!\n",__FUNCTION__);
-        return -1;
+    kernel_buf = malloc(kernel_len);
+    if (!kernel_buf) { fprintf(stderr, "Out of memory.\n"); goto cleanup; }
+    if (fread(kernel_buf, 1, kernel_len, fp) != kernel_len) {
+        fprintf(stderr, "Short read of input kernel.\n"); goto cleanup;
     }
-    
-    if (*(uint32_t*)kernel_buf == 0xbebafeca) {
-        printf("%s: Detected fat macho kernel\n",__FUNCTION__);
-        memmove(kernel_buf,kernel_buf+28,kernel_len);
+    fclose(fp); fp = NULL;
+    unsigned char *image = kernel_buf;
+    size_t image_len = kernel_len;
+    if (read_be32(kernel_buf) == 0xcafebabe) {
+        /* watchOS 5/6 OTAs can contain one ARMv7k slice in a FAT wrapper.
+         * Keep that wrapper intact; validate its extent before taking a view. */
+        uint32_t count = read_be32(kernel_buf+4);
+        uint32_t offset = read_be32(kernel_buf+16), size = read_be32(kernel_buf+20);
+        uint32_t alignment = read_be32(kernel_buf+24);
+        if (count != 1 || offset < 28 || offset > kernel_len || size < 32 ||
+            size > kernel_len - offset || alignment > 31 ||
+            (offset & ((UINT32_C(1) << alignment) - 1))) {
+            fprintf(stderr, "Invalid or unsupported FAT wrapper; expected one bounded slice.\n");
+            goto cleanup;
+        }
+        image = kernel_buf + offset;
+        image_len = size;
+        if (read_le32(image+4) != read_be32(kernel_buf+8) ||
+            read_le32(image+8) != read_be32(kernel_buf+12)) {
+            fprintf(stderr, "FAT slice architecture does not match its header.\n");
+            goto cleanup;
+        }
+        printf("Single-slice FAT input: file 0x%x, size 0x%x; wrapper preserved.\n", offset, size);
     }
-    
-    for(int i=0;i<argc;i++) {
-        if(strcmp(argv[i], "-a") == 0) {
+    uint32_t magic = read_le32(image), cpu = read_le32(image+4);
+    if (magic == 0xfeedface && cpu == 12) {
+        if (flags != 1) {
+            fprintf(stderr, "ARMv7k supports only -a. ARM64-only flags were refused.\n");
+            goto cleanup;
+        }
+        printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
+        if (patch_watch_kernel(image, image_len, dry_run)) goto cleanup;
+    } else if (magic == 0xfeedfacf && cpu == 0x0100000c) {
+        /* The legacy ARM64 finders operate on the raw thin Mach-O image. */
+        uint32_t ncmds = read_le32(image+16), cmds_size = read_le32(image+20);
+        size_t pos = 32, end;
+        if (cmds_size > image_len - 32 || !ncmds || ncmds > cmds_size / 8) {
+            fprintf(stderr, "Invalid ARM64 load-command table.\n"); goto cleanup;
+        }
+        end = pos + cmds_size;
+        for (uint32_t i = 0; i < ncmds; ++i) {
+            if (end - pos < 8) { fprintf(stderr, "Truncated load command.\n"); goto cleanup; }
+            uint32_t cmdsize = read_le32(image+pos+4);
+            if (cmdsize < 8 || cmdsize > end - pos) {
+                fprintf(stderr, "Invalid load-command size.\n"); goto cleanup;
+            }
+            pos += cmdsize;
+        }
+        if (pos != end) { fprintf(stderr, "Invalid load-command extent.\n"); goto cleanup; }
+        if (flags & 1) {
             printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
-            get_amfi_out_of_my_way_patch(kernel_buf,kernel_len);
+            if (memmem(image, image_len, "RELEASE_ARM64_T8006", 18)) {
+                if (patch_watch_kernel(image, image_len, dry_run)) goto cleanup;
+            } else if (get_amfi_out_of_my_way_patch(image, image_len)) goto cleanup;
         }
-        if(strcmp(argv[i], "-f") == 0) {
+        if (flags & 2) {
             printf("Kernel: Adding AppleFirmwareUpdate img4 signature check patch...\n");
-            get_AppleFirmwareUpdate_img4_signature_check(kernel_buf,kernel_len);
+            if (get_AppleFirmwareUpdate_img4_signature_check(image, image_len)) goto cleanup;
         }
-        if(strcmp(argv[i], "-s") == 0) {
+        if (flags & 4) {
             printf("Kernel: Adding SPUFirmwareValidation patch...\n");
-            get_SPUFirmwareValidation_patch(kernel_buf,kernel_len);
+            if (get_SPUFirmwareValidation_patch(image, image_len)) goto cleanup;
         }
-        if(strcmp(argv[i], "-p") == 0) {
+        if (flags & 32) {
             printf("Kernel: Adding AMFIInitializeLocalSigningPublicKey patch...\n");
-            get_AMFIInitializeLocalSigningPublicKey_patch(kernel_buf,kernel_len);
+            if (get_AMFIInitializeLocalSigningPublicKey_patch(image, image_len)) goto cleanup;
         }
-        if(strcmp(argv[i], "-r") == 0) {
+        if (flags & 8) {
             printf("Kernel: Adding RootVPNotAuthenticatedAfterMounting patch...\n");
-            get_RootVPNotAuthenticatedAfterMounting_patch(kernel_buf,kernel_len);
+            if (get_RootVPNotAuthenticatedAfterMounting_patch(image, image_len)) goto cleanup;
         }
-        if(strcmp(argv[i], "-o") == 0) {
+        if (flags & 16) {
             printf("Kernel: Adding could_not_authenticate_personalized_root_hash patch...\n");
-            get_could_not_authenticate_personalized_root_hash_patch(kernel_buf,kernel_len);
+            if (get_could_not_authenticate_personalized_root_hash_patch(image, image_len)) goto cleanup;
         }
+    } else {
+        fprintf(stderr, "Expected a decompressed ARM64 or supported ARMv7k Mach-O kernel.\n");
+        fprintf(stderr, "Unpack IMG4/IM4P containers first.\n");
+        goto cleanup;
     }
-    
-    /* Write patched kernel */
+    if (dry_run) {
+        puts("Dry run complete. No output written.");
+        result = 0;
+        goto cleanup;
+    }
+    /* Commit output only after every requested patch succeeds. */
     printf("%s: Writing out patched file to %s...\n", __FUNCTION__, argv[2]);
-    
-    fp = fopen(argv[2], "wb+");
-    if(!fp) {
-        printf("%s: Unable to open %s!\n", __FUNCTION__, argv[2]);
-        free(kernel_buf);
-        return -1;
+    char *temporary = malloc(strlen(argv[2]) + sizeof(".tmp.XXXXXX"));
+    if (!temporary) goto cleanup;
+    sprintf(temporary, "%s.tmp.XXXXXX", argv[2]);
+    int fd = mkstemp(temporary);
+    if (fd < 0) { perror(temporary); free(temporary); goto cleanup; }
+    fp = fdopen(fd, "wb");
+    if (!fp) {
+        perror("fdopen"); close(fd); unlink(temporary); free(temporary); goto cleanup;
     }
-    
-    fwrite(kernel_buf, 1, kernel_len, fp);
-    fflush(fp);
-    fclose(fp);
-    
-    free(kernel_buf);
-    
+    int failed = fwrite(kernel_buf, 1, kernel_len, fp) != kernel_len;
+    if (fclose(fp)) failed = 1;
+    fp = NULL;
+    if (failed || rename(temporary, argv[2])) {
+        fprintf(stderr, "Failed to write output kernel.\n");
+        unlink(temporary); free(temporary); goto cleanup;
+    }
+    free(temporary);
     printf("%s: Quitting...\n", __FUNCTION__);
-    
-    return 0;
+    result = 0;
+cleanup:
+    if (fp) fclose(fp);
+    free(kernel_buf);
+    return result;
 }

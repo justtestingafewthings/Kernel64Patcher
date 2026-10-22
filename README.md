@@ -1,5 +1,5 @@
 # Kernel64Patcher
-An ARM64 kernel patcher based on xerub's patchfinder64, with ARMv7k support for Apple Watch Series 0-3.
+An ARM64 kernel patcher based on xerub's patchfinder64, for iOS 10-18, tvOS 10-26, and watchOS 3-8.
 
 ## Compiling
 ```

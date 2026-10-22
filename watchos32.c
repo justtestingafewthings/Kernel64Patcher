@@ -66,6 +66,7 @@ static void watch_sha256(const unsigned char *data, size_t len,
 
 struct watch_patch {
     const char *name;
+    int flag;
     size_t offset;
     uint64_t address;
     size_t size;
@@ -77,13 +78,30 @@ struct watch_profile {
     size_t length;
     uint32_t magic, cpu, subtype;
     unsigned char stock_hash[32];
+    int supported_flags, not_applicable;
     size_t count;
-    struct watch_patch patches[6];
+    struct watch_patch patches[10];
 };
 
 #include "watchos32-profiles.h"
 
-static int patch_watch_kernel(unsigned char *buf, size_t len, int dry_run) {
+static void report_not_applicable(int flags) {
+    static const char *names[] = {
+        "AMFI trust-cache patch",
+        "AppleFirmwareUpdate validation bypass",
+        "SPU firmware-validation failure guard",
+        "rootvp authentication panic",
+        "personalized root-hash verification path",
+        "AMFI local-signing-key acquisition panic"
+    };
+    const char letters[] = "afsrop";
+    for (size_t i = 0; i < sizeof(letters)-1; ++i)
+        if (flags & (1 << i))
+            printf("-%c: not applicable; this kernel has no %s targeted by this patch. No change.\n",
+                   letters[i], names[i]);
+}
+
+static int patch_watch_kernel(unsigned char *buf, size_t len, int flags, int dry_run) {
     const struct watch_profile *profile = NULL;
     if (len < 28) {
         fprintf(stderr, "Truncated Watch kernel.\n");
@@ -123,9 +141,15 @@ static int patch_watch_kernel(unsigned char *buf, size_t len, int dry_run) {
         fprintf(stderr, "No output written.\n");
         return -1;
     }
+    if (flags & ~(profile->supported_flags | profile->not_applicable)) {
+        fprintf(stderr, "Requested flags are unverified for this Watch kernel. No output written.\n");
+        return -1;
+    }
     printf("Verified %s kernel SHA-256.\n", profile->name);
+    report_not_applicable(flags & profile->not_applicable);
     for (size_t i = 0; i < profile->count; ++i) {
         const struct watch_patch *p = &profile->patches[i];
+        if (!(flags & p->flag)) continue;
         int done = !memcmp(buf+p->offset, p->replacement, p->size);
         printf("%s: VA 0x%llx, file 0x%zx: %s\n", p->name,
                (unsigned long long)p->address,

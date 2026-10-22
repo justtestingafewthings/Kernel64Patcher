@@ -15,6 +15,7 @@
 
 #include "patchfinder64.c"
 #include "watchos32.c"
+#include "modern.c"
 
 #define GET_OFFSET(kernel_len, x) (x - (uintptr_t) kernel_buf)
 
@@ -372,10 +373,10 @@ static void usage(const char *program) {
     fprintf(stderr, "Usage: %s <kernel_in> <kernel_out> <args>\n", program);
     fprintf(stderr, "\t-a\t\tPatch AMFI\n");
     fprintf(stderr, "\t-f\t\tPatch AppleFirmwareUpdate img4 signature check\n");
-    fprintf(stderr, "\t-s\t\tPatch SPUFirmwareValidation (iOS 15 Only)\n");
-    fprintf(stderr, "\t-r\t\tPatch RootVPNotAuthenticatedAfterMounting (iOS 15 Only)\n");
-    fprintf(stderr, "\t-o\t\tPatch could_not_authenticate_personalized_root_hash (iOS 15 Only)\n");
-    fprintf(stderr, "\t-p\t\tPatch AMFIInitializeLocalSigningPublicKey (iOS 15 Only)\n");
+    fprintf(stderr, "\t-s\t\tPatch SPU firmware-validation failure (iOS 15+)\n");
+    fprintf(stderr, "\t-r\t\tPatch rootvp authentication panic (iOS 15+)\n");
+    fprintf(stderr, "\t-o\t\tPatch personalized root-hash authentication (iOS 15+)\n");
+    fprintf(stderr, "\t-p\t\tPatch AMFI local-signing-key panic (iOS 15+)\n");
     fprintf(stderr, "  --dry-run  Validate and report without writing output\n");
 }
 
@@ -423,7 +424,7 @@ int main(int argc, char **argv) {
     unsigned char *image = kernel_buf;
     size_t image_len = kernel_len;
     if (read_be32(kernel_buf) == 0xcafebabe) {
-        /* watchOS 5/6 OTAs can contain one ARMv7k slice in a FAT wrapper.
+        /* Watch OTAs and modern iPad kernels can contain one FAT slice.
          * Keep that wrapper intact; validate its extent before taking a view. */
         uint32_t count = read_be32(kernel_buf+4);
         uint32_t offset = read_be32(kernel_buf+16), size = read_be32(kernel_buf+20);
@@ -445,12 +446,7 @@ int main(int argc, char **argv) {
     }
     uint32_t magic = read_le32(image), cpu = read_le32(image+4);
     if (magic == 0xfeedface && cpu == 12) {
-        if (flags != 1) {
-            fprintf(stderr, "ARMv7k supports only -a. ARM64-only flags were refused.\n");
-            goto cleanup;
-        }
-        printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
-        if (patch_watch_kernel(image, image_len, dry_run)) goto cleanup;
+        if (patch_watch_kernel(image, image_len, flags, dry_run)) goto cleanup;
     } else if (magic == 0xfeedfacf && cpu == 0x0100000c) {
         /* The legacy ARM64 finders operate on the raw thin Mach-O image. */
         uint32_t ncmds = read_le32(image+16), cmds_size = read_le32(image+20);
@@ -468,10 +464,13 @@ int main(int argc, char **argv) {
             pos += cmdsize;
         }
         if (pos != end) { fprintf(stderr, "Invalid load-command extent.\n"); goto cleanup; }
+        int profiled = patch_modern_kernel(image, image_len, flags, dry_run);
+        if (profiled < 0) goto cleanup;
+        if (profiled == 0) goto patches_complete;
         if (flags & 1) {
             printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
             if (memmem(image, image_len, "RELEASE_ARM64_T8006", 18)) {
-                if (patch_watch_kernel(image, image_len, dry_run)) goto cleanup;
+                if (patch_watch_kernel(image, image_len, flags, dry_run)) goto cleanup;
             } else if (get_amfi_out_of_my_way_patch(image, image_len)) goto cleanup;
         }
         if (flags & 2) {
@@ -499,6 +498,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Unpack IMG4/IM4P containers first.\n");
         goto cleanup;
     }
+patches_complete:
     if (dry_run) {
         puts("Dry run complete. No output written.");
         result = 0;

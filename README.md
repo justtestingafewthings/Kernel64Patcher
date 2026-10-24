@@ -1,5 +1,5 @@
 # Kernel64Patcher
-An ARM64 kernel patcher based on xerub's patchfinder64, for iOS 10-18, tvOS 10-26, and watchOS 3-8.
+An ARM64 and ARMv7k kernel patcher based on xerub's patchfinder64, for iOS 10-18, tvOS 10-26, and watchOS 1-8.
 
 ## Compiling
 ```

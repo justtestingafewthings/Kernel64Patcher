@@ -8,365 +8,36 @@
 #endif
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "patchfinder64.c"
+#include "patches.h"
 #include "watchos32.c"
-#include "modern.c"
+#include "dynamic.c"
 
-#define GET_OFFSET(kernel_len, x) (x - (uintptr_t) kernel_buf)
-
-static uint32_t arm64_branch_instruction(uintptr_t from, uintptr_t to) {
-  return from > to ? 0x18000000 - (from - to) / 4 : 0x14000000 + (to - from) / 4;
+/* Resolve the containing directory even when the target does not exist yet. */
+static char *canonical_target(const char *path) {
+    char *copy=strdup(path);
+    if(!copy) return NULL;
+    char *slash=strrchr(copy,'/');
+    const char *base=slash?slash+1:copy;
+    char *directory;
+    if(slash) { *slash=0;directory=realpath(*copy?copy:"/",NULL); }
+    else directory=realpath(".",NULL);
+    if(!directory) { free(copy);return NULL; }
+    char *answer=malloc(strlen(directory)+strlen(base)+2);
+    if(answer) sprintf(answer,"%s/%s",directory,base);
+    free(directory);free(copy);return answer;
 }
-
-// iOS 15 "%s: firmware validation failed %d\" @%s:%d SPU Firmware Validation Patch
-int get_SPUFirmwareValidation_patch(void *kernel_buf, size_t kernel_len) {
-    printf("%s: Entering ...\n",__FUNCTION__);
-
-    char rootvpString[43] = "\"%s: firmware validation failed %d\" @%s:%d";
-    void* ent_loc = memmem(kernel_buf,kernel_len,rootvpString,42);
-    if(!ent_loc) {
-        printf("%s: Could not find \"%%s: firmware validation failed %%d\" @%%s:%%d string\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"%%s: firmware validation failed %%d\" @%%s:%%d\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-    addr_t xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-    if(!xref_stuff) {
-        printf("%s: Could not find \"%%s: firmware validation failed %%d\" @%%s:%%d xref\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"%%s: firmware validation failed %%d\" @%%s:%%d\" ref at %p\n",__FUNCTION__,(void*)xref_stuff);
-    addr_t beg_func = bof64(kernel_buf,0,xref_stuff);
-    if(!beg_func) {
-        printf("%s: Could not find firmware validation function start\n",__FUNCTION__);
-        return -1;
-    }
-    xref_stuff = xref64code(kernel_buf,0,(addr_t)GET_OFFSET(kernel_len, beg_func), beg_func);
-    if(!xref_stuff) {
-        printf("%s: Could not find previous xref\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found function xref at %p\n",__FUNCTION__,(void*)xref_stuff);
-    addr_t next_bl = step64_back(kernel_buf, xref_stuff, 100, INSN_CALL);
-    if(!next_bl) {
-        printf("%s: Could not find previous bl\n",__FUNCTION__);
-        return -1;
-    }
-    next_bl = step64_back(kernel_buf, (next_bl - 0x4), 100, INSN_CALL);
-    if(!next_bl) {
-        printf("%s: Could not find previous bl\n",__FUNCTION__);
-        return -1;
-    }
-    next_bl = step64_back(kernel_buf, (next_bl - 0x4), 100, INSN_CALL);
-    if(!next_bl) {
-        printf("%s: Could not find previous bl\n",__FUNCTION__);
-        return -1;
-    }
-    beg_func = bof64(kernel_buf,0,next_bl);
-    if(!beg_func) {
-        printf("%s: Could not find start of firmware validation function\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Patching SPU Firmware Validation at %p\n\n", __FUNCTION__,(void*)(beg_func));
-    *(uint32_t *) (kernel_buf + beg_func) = 0xD65F03C0;
-    return 0;
-}
-
-// iOS 15 rootvp not authenticated after mounting Patch
-int get_RootVPNotAuthenticatedAfterMounting_patch(void *kernel_buf, size_t kernel_len) {
-    printf("%s: Entering ...\n",__FUNCTION__);
-    char rootVPString[40] = "rootvp not authenticated after mounting";
-    char md0String[] = "md0";
-    void* ent_loc = memmem(kernel_buf,kernel_len,md0String,3);
-    if(!ent_loc) {
-        printf("%s: Could not find \"md0\" string\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"md0\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-    addr_t xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-    if(!xref_stuff) {
-        printf("%s: Could not find \"md0\" xref\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"md0\" ref at %p\n",__FUNCTION__,(void*)xref_stuff);
-    addr_t next_bl = step64(kernel_buf, xref_stuff + 0x8, 100, INSN_CALL);
-    if(!next_bl) {
-        // Newer devices will fail here, so using another string is required
-        printf("%s: Failed to use \"md0\", swapping to \"rootvp not authenticated after mounting\"\n",__FUNCTION__);
-        ent_loc = memmem(kernel_buf,kernel_len,rootVPString,39);
-        if(!ent_loc) {
-            printf("%s: Could not find \"rootvp not authenticated after mounting\" string\n",__FUNCTION__);
-            return -1;
-        }
-        printf("%s: Found \"rootvp not authenticated after mounting\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-        xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-        if(!xref_stuff) {
-            printf("%s: Could not find \"rootvp not authenticated after mounting\" xref\n",__FUNCTION__);
-            return -1;
-        }
-        printf("%s: Found \"rootvp not authenticated after mounting\" str xref at %p\n",__FUNCTION__,(void*)xref_stuff);
-        addr_t beg_func = bof64(kernel_buf,0,xref_stuff);
-        if(!beg_func) {
-            printf("%s: Could not find function start\n",__FUNCTION__);
-            return -1;
-        }
-        beg_func = beg_func + 0xA98;
-        printf("%s: Found function start at %p\n",__FUNCTION__,(void*)beg_func);
-        next_bl = step64(kernel_buf, beg_func, 100, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-    } else {
-        next_bl = step64(kernel_buf, next_bl + 0x8, 100, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-        next_bl = step64(kernel_buf, next_bl + 0x8, 100, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-        next_bl = step64(kernel_buf, next_bl + 0x8, 100, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-        next_bl = step64(kernel_buf, next_bl + 0x8, 100, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-    }
-    printf("%s: Patching ROOTVP at %p\n\n", __FUNCTION__,(void*)(next_bl + 0x4));
-    *(uint32_t *) (kernel_buf + next_bl + 0x4) = 0xD503201F;
-
-    return 0;
-}
-
-// iOS 15 AMFI Kernel Patch
-int get_AMFIInitializeLocalSigningPublicKey_patch(void* kernel_buf,size_t kernel_len) {
-    printf("%s: Entering ...\n",__FUNCTION__);
-
-    char AMFIString[] = "\"AMFI: %s: unable to obtain local signing public key";
-    void* ent_loc = memmem(kernel_buf,kernel_len,AMFIString,51);
-    if(!ent_loc) {
-        printf("%s: Could not find \"AMFI: %%s: unable to obtain local signing public key\" string\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"AMFI: %%s: unable to obtain local signing public key\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-    addr_t xref_stuff = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-    if(!xref_stuff) {
-        printf("%s: Could not find \"AMFI: %%s: unable to obtain local signing public key\" xref\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"AMFI: %%s: unable to obtain local signing public key ref at %p\n",__FUNCTION__,(void*)xref_stuff);
-
-    printf("%s: Patching \"Local Signing Public Key\" at %p\n\n", __FUNCTION__,(void*)(xref_stuff + 0x4));
-    *(uint32_t *) (kernel_buf + xref_stuff + 0x4) = 0xD503201F;
-    
-    return 0;
-}
-
-//iOS 14 AppleFirmwareUpdate img4 signature check
-int get_AppleFirmwareUpdate_img4_signature_check(void* kernel_buf,size_t kernel_len) {
-
-    printf("%s: Entering ...\n",__FUNCTION__);
-
-    char img4_sig_check_string[56] = "%s::%s() Performing img4 validation outside of workloop";
-    void* ent_loc = memmem(kernel_buf,kernel_len,img4_sig_check_string,55);
-    if(!ent_loc) {
-        printf("%s: Could not find \"%%s::%%s() Performing img4 validation outside of workloop\" string\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"%%s::%%s() Performing img4 validation outside of workloop\" str loc at %p\n",__FUNCTION__,GET_OFFSET(kernel_len,ent_loc));
-    addr_t ent_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-
-    if(!ent_ref) {
-        printf("%s: Could not find \"%%s::%%s() Performing img4 validation outside of workloop\" xref\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found \"%%s::%%s() Performing img4 validation outside of workloop\" xref at %p\n",__FUNCTION__,(void*)ent_ref);
-
-    printf("%s: Patching \"%%s::%%s() Performing img4 validation outside of workloop\" at %p\n\n", __FUNCTION__,(void*)(ent_ref + 0xc));
-    *(uint32_t *) (kernel_buf + ent_ref + 0xc) = 0xD2800000;
-
-    return 0;
-}
-
-static addr_t
-cbz_ref64_back(const uint8_t *buf, addr_t start, size_t length) {
-
-    //find cbz/cbnz
-    uint32_t cbz_mask = 0x7E000000;
-    uint32_t instr = 0;
-    uint32_t imm = 0;
-    addr_t cbz = start;
-    while (cbz) {
-        instr = *(uint32_t *) (buf + cbz);
-        if ((instr & cbz_mask) == 0x34000000) {
-            imm = ((instr & 0x00FFFFFF) >> 5) << 2;
-            if (cbz + imm == start)
-                return cbz;
-        }
-        cbz -= 4;
-    }
-    return 0;
-}
-
-//iOS 15 "could not authenticate personalized root hash!" patch
-int get_could_not_authenticate_personalized_root_hash_patch(void* kernel_buf,size_t kernel_len) {
-
-    printf("%s: Entering ...\n", __FUNCTION__);
-
-    //get target offset for new branch
-    char roothash_authenticated_string[sizeof("successfully validated on-disk root hash")] = "successfully validated on-disk root hash";
-
-    unsigned char *roothash_authenticated_loc = memmem(kernel_buf, kernel_len, roothash_authenticated_string, sizeof("successfully validated on-disk root hash") - 1);
-    if(!roothash_authenticated_loc) {
-        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, roothash_authenticated_string);
-        return -1;
-    }
-
-    for (; *roothash_authenticated_loc != 0; roothash_authenticated_loc--);
-    roothash_authenticated_loc++;
-    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, roothash_authenticated_string, GET_OFFSET(kernel_len, roothash_authenticated_loc));
-
-    addr_t roothash_authenticated_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, roothash_authenticated_loc));
-    if(!roothash_authenticated_ref) {
-        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, roothash_authenticated_string);
-        return -1;
-    }
-    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, roothash_authenticated_string, (void*) roothash_authenticated_ref);
-
-    //get previous cbz
-    addr_t branch_target = step64_back(kernel_buf, roothash_authenticated_ref, 20 * 4, 0x34000000, 0x7E000000);
-    if(!branch_target) {
-        printf("%s: Could not find previous cbz\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Found previous cbz at %p\n",__FUNCTION__, (void*) branch_target);
-    branch_target++;
-
-    //get patching offset for new branch
-    char roothash_failed_string[sizeof("could not authenticate personalized root hash!")] = "could not authenticate personalized root hash!";
-
-    unsigned char *roothash_failed_loc = memmem(kernel_buf, kernel_len, roothash_failed_string, sizeof("could not authenticate personalized root hash!") - 1);
-    if(!roothash_failed_loc) {
-        printf("%s: Could not find \"%s\" string\n", __FUNCTION__, roothash_failed_string);
-        return -1;
-    }
-
-    for (; *roothash_failed_loc != 0; roothash_failed_loc--);
-    roothash_failed_loc++;
-    printf("%s: Found \"%s\" str loc at %p\n", __FUNCTION__, roothash_failed_string, GET_OFFSET(kernel_len, roothash_failed_loc));
-
-    addr_t roothash_failed_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, roothash_failed_loc));
-    if(!roothash_failed_ref) {
-        printf("%s: Could not find \"%s\" xref\n",__FUNCTION__, roothash_failed_string);
-        return -1;
-    }
-    printf("%s: Found \"%s\" xref at %p\n",__FUNCTION__, roothash_failed_string, (void*) roothash_failed_ref);
-
-    addr_t patch_loc = 0;
-
-    for (int i = 0; i < 16; i++, roothash_failed_ref -= 4) {
-        if (cbz_ref64_back(kernel_buf, roothash_failed_ref, roothash_failed_ref)) {
-            printf("%s: Found cbz target at %p\n", __FUNCTION__, (void*) roothash_failed_ref);
-            patch_loc = roothash_failed_ref;
-            break;
-        }
-    }
-
-    if (!patch_loc) {
-        printf("%s: Could not find cbz target\n",__FUNCTION__);
-        return -1;
-    }
-
-    printf("%s: Patching root hash check at %p\n",__FUNCTION__, (void*) patch_loc);
-    *((uint32_t *) (kernel_buf + patch_loc)) = arm64_branch_instruction((uintptr_t) patch_loc, (uintptr_t) branch_target);
-
-    return 0;
-}
-
-int get_amfi_out_of_my_way_patch(void* kernel_buf,size_t kernel_len) {
-    
-    printf("%s: Entering ...\n",__FUNCTION__);
-    
-    const unsigned char *xnu = memmem(kernel_buf,kernel_len,"root:xnu-",9);
-    if (!xnu) {
-        fprintf(stderr, "Missing XNU version string.\n");
-        return -1;
-    }
-    const unsigned char *version = xnu + 9;
-    const unsigned char *end = (const unsigned char *)kernel_buf + kernel_len;
-    int kernel_vers = 0;
-    if (version == end || *version < '0' || *version > '9') {
-        fprintf(stderr, "Invalid XNU version string.\n");
-        return -1;
-    }
-    while (version < end && *version >= '0' && *version <= '9') {
-        int digit = *version++ - '0';
-        if (kernel_vers > (INT32_MAX - digit) / 10) {
-            fprintf(stderr, "Invalid XNU version string.\n");
-            return -1;
-        }
-        kernel_vers = kernel_vers * 10 + digit;
-    }
-    if (version == end) {
-        fprintf(stderr, "Invalid XNU version string.\n");
-        return -1;
-    }
-    printf("%s: Kernel-%d inputted\n",__FUNCTION__, kernel_vers);
-    char amfiString[33] = "entitlements too small";
-    int stringLen = 22;
-    if (kernel_vers >= 7938) { // Using "entitlements too small" fails on iOS 15 Kernels
-        strncpy(amfiString, "Internal Error: No cdhash found.", 33);
-        stringLen = 32;
-    }
-    void* ent_loc = memmem(kernel_buf,kernel_len,amfiString,stringLen);
-    if(!ent_loc) {
-        printf("%s: Could not find %s string\n",__FUNCTION__, amfiString);
-        return -1;
-    }
-    printf("%s: Found %s str loc at %p\n",__FUNCTION__,amfiString,GET_OFFSET(kernel_len,ent_loc));
-    addr_t ent_ref = xref64(kernel_buf,0,kernel_len,(addr_t)GET_OFFSET(kernel_len, ent_loc));
-    if(!ent_ref) {
-        printf("%s: Could not find %s xref\n",__FUNCTION__,amfiString);
-        return -1;
-    }
-    printf("%s: Found %s str ref at %p\n",__FUNCTION__,amfiString,(void*)ent_ref);
-    addr_t next_bl = step64(kernel_buf, ent_ref, 100, INSN_CALL);
-    if(!next_bl) {
-        printf("%s: Could not find next bl\n",__FUNCTION__);
-        return -1;
-    }
-    next_bl = step64(kernel_buf, next_bl+0x4, 200, INSN_CALL);
-    if(!next_bl) {
-        printf("%s: Could not find next bl\n",__FUNCTION__);
-        return -1;
-    }
-    if(kernel_vers>3789) { 
-        next_bl = step64(kernel_buf, next_bl+0x4, 200, INSN_CALL);
-        if(!next_bl) {
-            printf("%s: Could not find next bl\n",__FUNCTION__);
-            return -1;
-        }
-    }
-    addr_t function = follow_call64(kernel_buf, next_bl);
-    if(!function) {
-        printf("%s: Could not find function bl\n",__FUNCTION__);
-        return -1;
-    }
-    printf("%s: Patching AMFI at %p\n",__FUNCTION__,(void*)function);
-    *(uint32_t *)(kernel_buf + function) = 0x320003E0;
-    *(uint32_t *)(kernel_buf + function + 0x4) = 0xD65F03C0;
-    return 0;
+static int same_target(const char *a,const char *b) {
+    struct stat sa,sb;
+    if(!stat(a,&sa) && !stat(b,&sb) && sa.st_dev==sb.st_dev && sa.st_ino==sb.st_ino) return 1;
+    char *ca=canonical_target(a),*cb=canonical_target(b);
+    int same=ca && cb && !strcmp(ca,cb);
+    free(ca);free(cb);return same;
 }
 
 static void usage(const char *program) {
@@ -377,7 +48,12 @@ static void usage(const char *program) {
     fprintf(stderr, "\t-r\t\tPatch rootvp authentication panic (iOS 15+)\n");
     fprintf(stderr, "\t-o\t\tPatch personalized root-hash authentication (iOS 15+)\n");
     fprintf(stderr, "\t-p\t\tPatch AMFI local-signing-key panic (iOS 15+)\n");
+    fprintf(stderr, "\t-u\t\tPatch unencrypted data-volume panic guard\n");
     fprintf(stderr, "  --dry-run  Validate and report without writing output\n");
+    fprintf(stderr, "  --report <path>  Write a JSON patch report\n");
+    fprintf(stderr, "  --no-symbols  Discover patches without symbol-table assistance\n");
+    fprintf(stderr, "  --list-patches  List independent patch options\n");
+    kp_list(stderr);
 }
 
 int main(int argc, char **argv) {
@@ -385,22 +61,39 @@ int main(int argc, char **argv) {
     FILE *fp = NULL;
     size_t kernel_len;
     long length;
-    int flags = 0, dry_run = 0, result = 1;
+    int dry_run = 0, result = 1, report_allowed = 0, legacy_amfi = 0;
+    const char *report = NULL;
+    uint64_t selection = 0, explicit_selection = 0;
     struct stat in_stat, out_stat;
     if (argc == 2 && !strcmp(argv[1], "--help")) { usage(argv[0]); return 0; }
+    if (argc == 2 && !strcmp(argv[1], "--list-patches")) { kp_list(stdout); return 0; }
     if (argc < 4) { usage(argv[0]); return 1; }
     for (int i = 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
-        else if (!strcmp(argv[i], "-a")) flags |= 1;
-        else if (!strcmp(argv[i], "-f")) flags |= 2;
-        else if (!strcmp(argv[i], "-s")) flags |= 4;
-        else if (!strcmp(argv[i], "-r")) flags |= 8;
-        else if (!strcmp(argv[i], "-o")) flags |= 16;
-        else if (!strcmp(argv[i], "-p")) flags |= 32;
-        else { fprintf(stderr, "Unknown flag: %s\n", argv[i]); return 1; }
+        else if (!strcmp(argv[i], "--report")) {
+            if(report || i+1==argc) { fprintf(stderr,"Expected one report path.\n");return 1; }
+            report=argv[++i];
+        }
+        else if (!strcmp(argv[i], "--no-symbols")) kp_ignore_symbols=1;
+        else if (!strcmp(argv[i], "-a")) { selection |= KP_AMFI_BUNDLE;legacy_amfi=1; }
+        else if (!strcmp(argv[i], "-f")) selection |= KP_BIT(KP_FIRMWARE);
+        else if (!strcmp(argv[i], "-s")) selection |= KP_BIT(KP_SPU);
+        else if (!strcmp(argv[i], "-r")) selection |= KP_BIT(KP_ROOTVP);
+        else if (!strcmp(argv[i], "-o")) selection |= KP_BIT(KP_ROOT_HASH);
+        else if (!strcmp(argv[i], "-p")) selection |= KP_BIT(KP_LOCAL_SIGNING);
+        else if (!strcmp(argv[i], "-u")) selection |= KP_BIT(KP_UNENCRYPTED);
+        else {
+            unsigned id;
+            for(id=0;id<KP_COUNT;id++)
+                if(!strncmp(argv[i],"--",2) && !strcmp(argv[i]+2,kp_catalog[id].id)) break;
+            if(id==KP_COUNT) { fprintf(stderr, "Unknown flag: %s\n", argv[i]); return 1; }
+            selection|=KP_BIT(id);
+            explicit_selection|=KP_BIT(id);
+        }
     }
-    if (!flags) { usage(argv[0]); return 1; }
-    printf("%s: Starting...\n", __FUNCTION__);
+    if (!selection) { usage(argv[0]); return 1; }
+    kp.selection=selection;kp.dry_run=dry_run;
+    printf("%s: Starting...\n", __func__);
     fp = fopen(argv[1], "rb");
     if (!fp) { perror(argv[1]); return 1; }
     if (fstat(fileno(fp), &in_stat) ||
@@ -415,6 +108,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Input and output must be different files.\n");
         goto cleanup;
     }
+    if(report) {
+        if(same_target(report,argv[1]) || same_target(report,argv[2])) {
+            fprintf(stderr,"Report path must differ from input and output.\n");goto cleanup;
+        }
+        report_allowed=1;
+    }
     kernel_buf = malloc(kernel_len);
     if (!kernel_buf) { fprintf(stderr, "Out of memory.\n"); goto cleanup; }
     if (fread(kernel_buf, 1, kernel_len, fp) != kernel_len) {
@@ -424,8 +123,7 @@ int main(int argc, char **argv) {
     unsigned char *image = kernel_buf;
     size_t image_len = kernel_len;
     if (read_be32(kernel_buf) == 0xcafebabe) {
-        /* Watch OTAs and modern iPad kernels can contain one FAT slice.
-         * Keep that wrapper intact; validate its extent before taking a view. */
+        /* Preserve the FAT wrapper and patch only its single slice. */
         uint32_t count = read_be32(kernel_buf+4);
         uint32_t offset = read_be32(kernel_buf+16), size = read_be32(kernel_buf+20);
         uint32_t alignment = read_be32(kernel_buf+24);
@@ -445,10 +143,12 @@ int main(int argc, char **argv) {
         printf("Single-slice FAT input: file 0x%x, size 0x%x; wrapper preserved.\n", offset, size);
     }
     uint32_t magic = read_le32(image), cpu = read_le32(image+4);
+    kp.image=image;kp.length=image_len;kp.image_offset=(size_t)(image-kernel_buf);
     if (magic == 0xfeedface && cpu == 12) {
-        if (patch_watch_kernel(image, image_len, flags, dry_run)) goto cleanup;
+        if(legacy_amfi) kp.selection=(kp.selection&~KP_AMFI_BUNDLE)|explicit_selection|
+            KP_BIT(KP_AMFI_TRUST)|KP_BIT(KP_CS_ENFORCEMENT)|KP_BIT(KP_LIBRARY_VALIDATION);
+        if (patch_arm32_kernel(image, image_len, kp.selection)) goto cleanup;
     } else if (magic == 0xfeedfacf && cpu == 0x0100000c) {
-        /* The legacy ARM64 finders operate on the raw thin Mach-O image. */
         uint32_t ncmds = read_le32(image+16), cmds_size = read_le32(image+20);
         size_t pos = 32, end;
         if (cmds_size > image_len - 32 || !ncmds || ncmds > cmds_size / 8) {
@@ -464,69 +164,36 @@ int main(int argc, char **argv) {
             pos += cmdsize;
         }
         if (pos != end) { fprintf(stderr, "Invalid load-command extent.\n"); goto cleanup; }
-        int profiled = patch_modern_kernel(image, image_len, flags, dry_run);
-        if (profiled < 0) goto cleanup;
-        if (profiled == 0) goto patches_complete;
-        if (flags & 1) {
-            printf("Kernel: Adding AMFI_get_out_of_my_way patch...\n");
-            if (memmem(image, image_len, "RELEASE_ARM64_T8006", 18)) {
-                if (patch_watch_kernel(image, image_len, flags, dry_run)) goto cleanup;
-            } else if (get_amfi_out_of_my_way_patch(image, image_len)) goto cleanup;
-        }
-        if (flags & 2) {
-            printf("Kernel: Adding AppleFirmwareUpdate img4 signature check patch...\n");
-            if (get_AppleFirmwareUpdate_img4_signature_check(image, image_len)) goto cleanup;
-        }
-        if (flags & 4) {
-            printf("Kernel: Adding SPUFirmwareValidation patch...\n");
-            if (get_SPUFirmwareValidation_patch(image, image_len)) goto cleanup;
-        }
-        if (flags & 32) {
-            printf("Kernel: Adding AMFIInitializeLocalSigningPublicKey patch...\n");
-            if (get_AMFIInitializeLocalSigningPublicKey_patch(image, image_len)) goto cleanup;
-        }
-        if (flags & 8) {
-            printf("Kernel: Adding RootVPNotAuthenticatedAfterMounting patch...\n");
-            if (get_RootVPNotAuthenticatedAfterMounting_patch(image, image_len)) goto cleanup;
-        }
-        if (flags & 16) {
-            printf("Kernel: Adding could_not_authenticate_personalized_root_hash patch...\n");
-            if (get_could_not_authenticate_personalized_root_hash_patch(image, image_len)) goto cleanup;
-        }
+        if (patch_dynamic_kernel(image, image_len, kp.selection)) goto cleanup;
     } else {
-        fprintf(stderr, "Expected a decompressed ARM64 or supported ARMv7k Mach-O kernel.\n");
+        fprintf(stderr, "Expected a decompressed ARM or ARM64 Mach-O kernel.\n");
         fprintf(stderr, "Unpack IMG4/IM4P containers first.\n");
         goto cleanup;
     }
-patches_complete:
+    kp_print();
     if (dry_run) {
         puts("Dry run complete. No output written.");
         result = 0;
         goto cleanup;
     }
-    /* Commit output only after every requested patch succeeds. */
-    printf("%s: Writing out patched file to %s...\n", __FUNCTION__, argv[2]);
-    char *temporary = malloc(strlen(argv[2]) + sizeof(".tmp.XXXXXX"));
-    if (!temporary) goto cleanup;
-    sprintf(temporary, "%s.tmp.XXXXXX", argv[2]);
-    int fd = mkstemp(temporary);
-    if (fd < 0) { perror(temporary); free(temporary); goto cleanup; }
-    fp = fdopen(fd, "wb");
-    if (!fp) {
-        perror("fdopen"); close(fd); unlink(temporary); free(temporary); goto cleanup;
+    for(size_t i=0;i<kp.count;i++) {
+        const struct kp_edit *e=&kp.edits[i];
+        memcpy(image+e->off,e->after,e->size);
     }
-    int failed = fwrite(kernel_buf, 1, kernel_len, fp) != kernel_len;
-    if (fclose(fp)) failed = 1;
-    fp = NULL;
-    if (failed || rename(temporary, argv[2])) {
-        fprintf(stderr, "Failed to write output kernel.\n");
-        unlink(temporary); free(temporary); goto cleanup;
-    }
-    free(temporary);
-    printf("%s: Quitting...\n", __FUNCTION__);
+    printf("%s: Writing out patched file to %s...\n", __func__, argv[2]);
+    struct atomic_file output;
+    if (atomic_file_open(&output, argv[2])) { perror(argv[2]); goto cleanup; }
+    int failed = fwrite(kernel_buf, 1, kernel_len, output.stream) != kernel_len;
+    if (atomic_file_finish(&output, failed)) { perror(argv[2]); goto cleanup; }
+    kp.output_written=1;
+    printf("%s: Quitting...\n", __func__);
     result = 0;
 cleanup:
     if (fp) fclose(fp);
+    if(result) { kp_fail_pending();kp_print(); }
+    if(report_allowed && kp_report(report,result==0)) {
+        fprintf(stderr,"Cannot write JSON patch report.\n");result=1;
+    }
     free(kernel_buf);
     return result;
 }

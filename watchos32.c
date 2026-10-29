@@ -300,6 +300,219 @@ static int wk_policy(struct wk_image *im,enum kp_id id) {
     if(!found) return kp_unsupported("No validated code-signing policy entry; stripped fallback is unavailable");
     return 0;
 }
+/* XNU 933 uses ARM-mode FairPlayIOKit validation before AMFI. */
+static void wk_arm_references(struct wk_refs *out,const struct wk_image *im,uint32_t target) {
+    for(size_t m=0;m<im->nmodules;m++) {
+        struct wk_range code=im->modules[m].text;
+        for(size_t p=code.start;p+4<=code.end;p+=4) {
+            uint32_t w=read_le32(im->b+p);
+            /* ARM LDR Rt,[pc,+/-#imm], word, pre-indexed, no write-back. */
+            if((w&UINT32_C(0x0e000000))!=UINT32_C(0x04000000) ||
+               !(w&UINT32_C(0x01000000)) || (w&UINT32_C(0x00200000)) ||
+               !(w&UINT32_C(0x00100000)) || ((w>>16)&15)!=15) continue;
+            uint32_t base=wk_va(im,p)+8,imm=w&0xfff;
+            uint32_t value=(w&UINT32_C(0x00800000)) ? base+imm : base-imm;
+            size_t literal=wk_off(im,value);
+            if(literal!=SIZE_MAX && im->len-literal>=4 && read_le32(im->b+literal)==target)
+                wk_reference(out,p);
+        }
+    }
+}
+static int wk_arm_bne(const struct wk_image *im,size_t p,size_t *target) {
+    if(p>im->len || im->len-p<4) return 0;
+    uint32_t w=read_le32(im->b+p);
+    if((w&UINT32_C(0xff000000))!=UINT32_C(0x1a000000)) return 0;
+    int32_t delta=wk_signed((w&UINT32_C(0x00ffffff))<<2,26);
+    *target=wk_off(im,wk_va(im,p)+8+(uint32_t)delta);
+    return *target!=SIZE_MAX;
+}
+static int wk_arm_beq(const struct wk_image *im,size_t p,size_t *target) {
+    if(p>im->len || im->len-p<4) return 0;
+    uint32_t w=read_le32(im->b+p);
+    if((w&UINT32_C(0xff000000))!=UINT32_C(0x0a000000)) return 0;
+    int32_t delta=wk_signed((w&UINT32_C(0x00ffffff))<<2,26);
+    *target=wk_off(im,wk_va(im,p)+8+(uint32_t)delta);
+    return *target!=SIZE_MAX;
+}
+static int wk_arm_cmp_imm(uint32_t w,unsigned rn,unsigned imm) {
+    return (w&UINT32_C(0x0ff0ffff))==(UINT32_C(0x03500000)|imm) &&
+           ((w>>16)&15)==rn;
+}
+static int wk_arm_nop(uint32_t w) {
+    /* Accept Pwnage's zero word and the MOV r0,r0 used by earlier builds. */
+    return w==0 || w==UINT32_C(0xe1a00000);
+}
+static int wk_fairplay_sequence(const struct wk_image *im,struct wk_range code,size_t p,
+                                size_t *first,size_t *second) {
+    if(!wk_in(code,p,40)) return 0;
+    uint32_t a=read_le32(im->b+p),b=read_le32(im->b+p+4),c=read_le32(im->b+p+8);
+    uint32_t d=read_le32(im->b+p+12),e=read_le32(im->b+p+16),f=read_le32(im->b+p+20);
+    uint32_t g=read_le32(im->b+p+24),h=read_le32(im->b+p+28),i=read_le32(im->b+p+32);
+    uint32_t j=read_le32(im->b+p+36); unsigned state=(c>>12)&15,work=(d>>12)&15;
+    size_t branch_target;
+    if(!wk_arm_cmp_imm(a,state,0) ||
+       (!wk_arm_nop(b) && !wk_arm_bne(im,p+4,&branch_target)) ||
+       (c&UINT32_C(0x0ff00fff))!=UINT32_C(0x05d00007) || ((c>>16)&15)!=10 ||
+       (d&UINT32_C(0x0ff00fff))!=UINT32_C(0x02400003) || ((d>>16)&15)!=state ||
+       (e&UINT32_C(0x0ff00ff0))!=UINT32_C(0x06e00070) || ((e>>12)&15)!=work || (e&15)!=work ||
+       !wk_arm_cmp_imm(f,work,1) || (g&UINT32_C(0xff000000))!=UINT32_C(0x8a000000) ||
+       (h&UINT32_C(0x0ff00fff))!=UINT32_C(0x01d003be) || ((h>>16)&15)!=10 ||
+       !wk_arm_cmp_imm(i,(h>>12)&15,3) ||
+       (!wk_arm_nop(j) && !wk_arm_bne(im,p+36,&branch_target))) return 0;
+    if(!wk_arm_nop(b) || !wk_arm_nop(j)) {
+        size_t one,two;
+        if(!wk_arm_bne(im,p+4,&one) || !wk_arm_bne(im,p+36,&two) || one!=two ||
+           !wk_in(code,one,4) || (read_le32(im->b+one)&UINT32_C(0x0ff00fff))!=UINT32_C(0x03a00000)) return 0;
+    }
+    *first=p+4;*second=p+36;return 1;
+}
+/* The 1.0 FairPlay callback needs only its error result changed to true. */
+static int wk_fairplay_early_sequence(const struct wk_image *im,struct wk_range code,size_t p,size_t *edit) {
+    if(!wk_in(code,p,44)) return 0;
+    uint32_t call=read_le32(im->b+p+8),cmp=read_le32(im->b+p+12);
+    uint32_t add=read_le32(im->b+p+16),load=read_le32(im->b+p+20),store=read_le32(im->b+p+24);
+    uint32_t result=read_le32(im->b+p+32),next_cmp=read_le32(im->b+p+36);
+    size_t success,back;
+    if(call!=UINT32_C(0xe12fff33) || !wk_arm_cmp_imm(cmp,4,0) || add!=UINT32_C(0x02844001) ||
+       load!=UINT32_C(0x059a000c) || store!=UINT32_C(0x05860000) ||
+       !wk_arm_beq(im,p+28,&success) || success!=p+36 ||
+       (result!=UINT32_C(0xe3a04000) && result!=UINT32_C(0xe3a04001)) ||
+       !wk_arm_cmp_imm(next_cmp,5,0) || !wk_arm_bne(im,p+40,&back) || back>=p) return 0;
+    *edit=p+32;return 1;
+}
+static int wk_fairplay(struct wk_image *im) {
+    const char anchor[]="fairplay returned 0x%08x\n";
+    size_t text=wk_string(im,anchor,0);
+    if(text==SIZE_MAX) {
+        if(memmem(im->b,im->len,"FairPlayIOKit",13))
+            return kp_unsupported("FairPlay is present but its validated rejection path was not found");
+        kp_absent("This kernel has no FairPlay executable-validation component");return 0;
+    }
+    struct wk_refs refs={{0},0,0};wk_arm_references(&refs,im,wk_va(im,text));
+    size_t one=SIZE_MAX,two=SIZE_MAX,early=SIZE_MAX;
+    if(refs.overflow || !refs.count) return kp_unsupported("Cannot resolve the FairPlay diagnostic reference");
+    for(size_t n=0;n<refs.count;n++) {
+        struct wk_range code=wk_code(im,refs.positions[n]);
+        if(!code.end) return -1;
+        size_t end=refs.positions[n]+256;
+        if(end<refs.positions[n] || end>code.end) end=code.end;
+        for(size_t p=refs.positions[n];p+40<=end;p+=4) {
+            size_t a,b;
+            if(!wk_fairplay_sequence(im,code,p,&a,&b)) continue;
+            if(one!=SIZE_MAX && (one!=a || two!=b)) return -1;
+            one=a;two=b;
+        }
+        size_t candidate;
+        if(wk_fairplay_early_sequence(im,code,refs.positions[n],&candidate)) {
+            if(early!=SIZE_MAX && early!=candidate) return -1;
+            early=candidate;
+        }
+    }
+    if(one==SIZE_MAX && early==SIZE_MAX)
+        return kp_unsupported("No validated FairPlay executable-validation rejection path");
+    const unsigned char nop[4]={0,0,0,0};
+    if(one!=SIZE_MAX)
+        return wk_add(im,"FairPlay validation rejection #1",one,nop,4) ||
+               wk_add(im,"FairPlay validation rejection #2",two,nop,4);
+    const unsigned char yes[4]={1,0x40,0xa0,0xe3};
+    return wk_add(im,"FairPlay validation result",early,yes,4);
+}
+/* Preserve Pwnage's unaligned XNU 1228 patch offset and surrounding bytes. */
+static int wk_vm_map_protection(struct wk_image *im) {
+    static const unsigned char original[]={0x2b,0x99,0x91,0x43,0x2b,0x91,0xcd,0xe7,0x04,0x24,0x1d,0xb0};
+    static const unsigned char patched[]={0x2b,0x99,0x00,0x00,0x2b,0x91,0xcd,0xe7,0x04,0x24,0x1d,0xb0};
+    const size_t n=sizeof(original);size_t old=SIZE_MAX,done=SIZE_MAX;unsigned old_count=0,done_count=0;
+    if(im->xnu!=1228) {
+        kp_absent("This XNU revision has no validated legacy vm_map maximum-protection signature");return 0;
+    }
+    struct wk_range text=im->modules[0].text;
+    if(!text.end || text.end-text.start<n) return -1;
+    for(size_t p=text.start;p+n<=text.end;p++) {
+        if(!memcmp(im->b+p,original,n)) { old=p;old_count++; }
+        if(!memcmp(im->b+p,patched,sizeof(patched))) { done=p;done_count++; }
+    }
+    if((old_count==1 && done_count) || (done_count==1 && old_count) || old_count>1 || done_count>1)
+        return kp_unsupported("vm_map maximum-protection signature is ambiguous or partially patched");
+    if(old_count!=1 && done_count!=1) return kp_unsupported("No validated legacy vm_map maximum-protection signature");
+    size_t p=old_count?old:done;
+    const unsigned char replacement[]={0x2b,0x99,0x00,0x00};
+    return kp_add(p,wk_va(im,p),replacement,sizeof(replacement),"vm_map maximum-protection guard",0);
+}
+/* iPhone OS 2.0 has two identical AMFI hash helpers; 3.1.3 has one.
+ * Match the complete tail before changing its false result. */
+static int wk_amfi_vnode_validation(struct wk_image *im) {
+    static const unsigned char before[]={
+        0x0e,0x00,0x00,0x8a,0x48,0x30,0x9f,0xe5,0x01,0x30,0xd3,0xe7,0x14,0x00,0x53,0xe3,
+        0x40,0x30,0x9f,0x05,0x01,0x41,0x93,0x07,0x00,0x30,0xd4,0x05,0x03,0x00,0x5c,0x01,
+        0x06,0x00,0x00,0x1a,0x01,0x00,0x80,0xe2,0x01,0x10,0x84,0xe2,0x13,0x20,0xa0,0xe3,
+        0x24,0x30,0x9f,0xe5,0x33,0xff,0x2f,0xe1,0x00,0x00,0x50,0xe3,0x00,0x00,0x00,0x0a,
+        0x00,0x40,0xa0,0xe3,0x04,0x00,0xa0,0xe1,0x90,0x80,0xbd,0xe8
+    };
+    unsigned char after[sizeof(before)];memcpy(after,before,sizeof(after));after[64]=1;
+    size_t original[3],patched[3];unsigned originals=0,patches=0,expected;
+    if(im->xnu==1228) expected=2;
+    else if(im->xnu==1357) expected=1;
+    else {
+        kp_absent("This XNU revision has no validated legacy AMFI vnode-validation signature");return 0;
+    }
+    if(!im->prelink.end || !memmem(im->b,im->len,"amfi_allow_any_signature",25))
+        return kp_unsupported("AMFI vnode-validation component is absent or unmapped");
+    for(size_t p=im->prelink.start;p+sizeof(before)<=im->prelink.end;p++) {
+        if(!memcmp(im->b+p,before,sizeof(before))) {
+            if(originals==3) return kp_unsupported("AMFI vnode-validation signature is ambiguous");
+            original[originals++]=p;
+        }
+        if(!memcmp(im->b+p,after,sizeof(after))) {
+            if(patches==3) return kp_unsupported("AMFI vnode-validation signature is ambiguous");
+            patched[patches++]=p;
+        }
+    }
+    if(!((originals==expected && !patches) || (patches==expected && !originals)))
+        return kp_unsupported("AMFI vnode-validation signatures are missing or partially patched");
+    const size_t *sites=originals?original:patched;
+    const unsigned char yes[]={1,0x40,0xa0,0xe3};
+    static const char *const names[]={"AMFI vnode validation #1","AMFI vnode validation #2"};
+    for(unsigned i=0;i<expected;i++)
+        if(kp_add(sites[i]+64,wk_va(im,sites[i]+64),yes,sizeof(yes),names[i],0)) return -1;
+    return 0;
+}
+/* Match the 2.0 and 3.1.3 code-signature tails before changing rejection to success. */
+static int wk_legacy_cs_validation(struct wk_image *im) {
+    static const unsigned char before[]={
+        0x00,0x00,0x50,0xe3,0x00,0x50,0xa0,0x01,0x00,0x00,0x00,0x0a,0xff,0x50,0xa0,0xe3,
+        0x04,0x00,0xa0,0xe1,0x0a,0x10,0xa0,0xe1,0x24,0x30,0x9f,0xe5,0x33,0xff,0x2f,0xe1,
+        0x05,0x00,0xa0,0xe1,0x18,0xd0,0x47,0xe2,0x00,0x0d,0xbd,0xe8,0xf0,0x80,0xbd,0xe8
+    };
+    static const unsigned char ios3_before[]={
+        0x53,0x40,0x1c,0x43,0xa8,0x42,0xf7,0xd9,0x00,0x2c,0x00,0xd0,0xff,0x24,0x30,0x1c,
+        0x51,0x46,0x09,0x4b,0x98,0x47,0x12,0xb0,0x20,0x1c,0x1c,0xbc,0x90,0x46,0x9a,0x46,
+        0xa3,0x46,0xf0,0xbd,0x10,0x51,0x43,0xc0,0xa5,0x39,0x43,0xc0,0xf4,0x4e,0x43,0xc0
+    };
+    unsigned char after[sizeof(before)],ios3_after[sizeof(ios3_before)];
+    memcpy(after,before,sizeof(after));after[12]=0;
+    memcpy(ios3_after,ios3_before,sizeof(ios3_after));ios3_after[12]=0;
+    size_t old=SIZE_MAX,done=SIZE_MAX;unsigned old_count=0,done_count=0;
+    if(im->xnu!=1228 && im->xnu!=1357) {
+        kp_absent("This XNU revision has no validated legacy code-signature result signature");return 0;
+    }
+    if(!im->prelink.end) return kp_unsupported("Legacy code-signature text is unmapped");
+    const unsigned char *original=im->xnu==1228?before:ios3_before;
+    const unsigned char *patched=im->xnu==1228?after:ios3_after;
+    size_t length=im->xnu==1228?sizeof(before):sizeof(ios3_before);
+    for(size_t p=im->prelink.start;p+length<=im->prelink.end;p++) {
+        if(!memcmp(im->b+p,original,length)) { old=p;old_count++; }
+        if(!memcmp(im->b+p,patched,length)) { done=p;done_count++; }
+    }
+    if((old_count==1 && done_count) || (done_count==1 && old_count) || old_count>1 || done_count>1)
+        return kp_unsupported("Legacy code-signature result signature is ambiguous or partially patched");
+    if(old_count!=1 && done_count!=1) return kp_unsupported("No validated legacy code-signature result signature");
+    size_t p=old_count?old:done;
+    const unsigned char success_arm[]={0,0x50,0xa0,0xe3};
+    const unsigned char success_thumb[]={0,0x24};
+    const unsigned char *success=im->xnu==1228?success_arm:success_thumb;
+    size_t success_length=im->xnu==1228?sizeof(success_arm):sizeof(success_thumb);
+    return kp_add(p+12,wk_va(im,p+12),success,success_length,"Legacy code-signature result",0);
+}
 static int wk_amfi(struct wk_image *im) {
     const unsigned char yes[4]={1,0x20,0x70,0x47};
     struct wk_range code={0,0};
@@ -551,6 +764,10 @@ static int patch_arm32_kernel(unsigned char *buf,size_t len,uint64_t selection) 
         case KP_APFS_MOUNT_AUTH:case KP_APFS_REMOUNT:
             rc=kp_unsupported("No validated ARM APFS finder for this guard");
             break;
+        case KP_FAIRPLAY_VALIDATION:rc=wk_fairplay(&im);break;
+        case KP_VM_MAP_PROTECTION:rc=wk_vm_map_protection(&im);break;
+        case KP_AMFI_VNODE_VALIDATION:rc=wk_amfi_vnode_validation(&im);break;
+        case KP_LEGACY_CS_VALIDATION:rc=wk_legacy_cs_validation(&im);break;
         default:rc=-1;break;
         }
         if(kp_finish(rc)) failed=1;

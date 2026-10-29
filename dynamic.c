@@ -289,6 +289,13 @@ static int patch_dynamic_kernel(unsigned char *buf,size_t len,uint64_t selection
         else if(id<=KP_UNENCRYPTED) rc=kd_aux(c,1<<(id-KP_FIRMWARE+1));
         else if(id==KP_APFS_MOUNT_AUTH) rc=da_apfs_mount_auth(c);
         else if(id==KP_APFS_REMOUNT) rc=da_apfs_remount(c);
+        else if(id==KP_FAIRPLAY_VALIDATION) {
+            kp_absent("This legacy FairPlay policy applies to ARM iPhone OS kernels");rc=0;
+        }
+        else if(id==KP_VM_MAP_PROTECTION) { kp_absent("This legacy vm_map guard applies to ARM iPhone OS 2.0 kernels");rc=0; }
+        else if(id==KP_AMFI_VNODE_VALIDATION || id==KP_LEGACY_CS_VALIDATION) {
+            kp_absent("This legacy iPhone OS 2.0 policy applies to ARM kernels");rc=0;
+        }
         else rc=kp_unsupported("This policy finder currently supports ARM32 kernels only");
         if(kp_finish(rc)) result=-1;
     }

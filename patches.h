@@ -8,7 +8,8 @@ enum kp_id {
     KP_AMFI_TRUST, KP_AMFI_SHA1, KP_LAUNCH_CONSTRAINTS, KP_DEVELOPER_MODE,
     KP_FIRMWARE, KP_SPU, KP_ROOTVP, KP_ROOT_HASH, KP_LOCAL_SIGNING,
     KP_UNENCRYPTED, KP_CS_ENFORCEMENT, KP_LIBRARY_VALIDATION,
-    KP_APFS_MOUNT_AUTH, KP_APFS_REMOUNT,
+    KP_APFS_MOUNT_AUTH, KP_APFS_REMOUNT, KP_FAIRPLAY_VALIDATION,
+    KP_VM_MAP_PROTECTION, KP_AMFI_VNODE_VALIDATION, KP_LEGACY_CS_VALIDATION,
     KP_COUNT
 };
 struct kp_descriptor { const char *id, *description; };
@@ -27,6 +28,10 @@ static const struct kp_descriptor kp_catalog[KP_COUNT] = {
     {"library-validation", "ARM32 library-validation policy"},
     {"apfs-mount-auth", "APFS kernel-task mount authorization"},
     {"apfs-remount", "APFS root-volume read/write remount guard"},
+    {"fairplay-validation", "legacy FairPlay executable validation"},
+    {"vm-map-protection", "legacy vm_map maximum-protection guard"},
+    {"amfi-vnode-validation", "legacy AMFI vnode-signature validation"},
+    {"legacy-cs-validation", "legacy code-signature result path"},
 };
 enum kp_status { KP_PENDING, KP_PLANNED, KP_ALREADY, KP_ABSENT, KP_UNSUPPORTED, KP_FAILED };
 struct kp_result { enum kp_status status; const char *reason; size_t matches, changes; };

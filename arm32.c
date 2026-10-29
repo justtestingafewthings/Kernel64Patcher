@@ -14,7 +14,7 @@ static uint32_t read_be32(const unsigned char *p) {
            (uint32_t)p[2] << 8 | p[3];
 }
 
-/* Discover Thumb kernel policy and kext paths from Mach-O metadata and code. */
+/* Discover ARM32 kernel policy and kext paths from Mach-O metadata and code. */
 #define WK_MAX_MAPS 32
 #define WK_MAX_MODULES 256
 struct wk_range { size_t start, end; };

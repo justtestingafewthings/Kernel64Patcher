@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #include "patches.h"
-#include "watchos32.c"
+#include "arm32.c"
 #include "dynamic.c"
 
 /* Resolve the containing directory even when the target does not exist yet. */

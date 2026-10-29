@@ -1,5 +1,4 @@
-/* Reject NAND migrations, formats and signature writes through the
- * initializer's existing error paths. Included by watchos32.c. */
+/* Preserve pre-A5 ARM32 NAND through the initializer's existing error paths. */
 struct np_function { struct wk_range code; size_t start, end; int arm; };
 struct np_call { size_t off, width, target; unsigned base, slot; int indirect; };
 

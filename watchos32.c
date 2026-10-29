@@ -733,6 +733,7 @@ static int wk_failure(struct wk_image *im,const char *anchor,const char *name,in
     }
     return wk_add(im,name,guard,nop,wk_width(im,guard));
 }
+#include "nand.c"
 
 static int patch_arm32_kernel(unsigned char *buf,size_t len,uint64_t selection) {
     struct wk_image im;
@@ -768,6 +769,7 @@ static int patch_arm32_kernel(unsigned char *buf,size_t len,uint64_t selection) 
         case KP_VM_MAP_PROTECTION:rc=wk_vm_map_protection(&im);break;
         case KP_AMFI_VNODE_VALIDATION:rc=wk_amfi_vnode_validation(&im);break;
         case KP_LEGACY_CS_VALIDATION:rc=wk_legacy_cs_validation(&im);break;
+        case KP_NAND_PRESERVE:rc=wk_nand_preserve(&im);break;
         default:rc=-1;break;
         }
         if(kp_finish(rc)) failed=1;

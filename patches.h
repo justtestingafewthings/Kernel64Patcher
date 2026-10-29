@@ -10,7 +10,7 @@ enum kp_id {
     KP_UNENCRYPTED, KP_CS_ENFORCEMENT, KP_LIBRARY_VALIDATION,
     KP_APFS_MOUNT_AUTH, KP_APFS_REMOUNT, KP_FAIRPLAY_VALIDATION,
     KP_VM_MAP_PROTECTION, KP_AMFI_VNODE_VALIDATION, KP_LEGACY_CS_VALIDATION,
-    KP_COUNT
+    KP_NAND_PRESERVE, KP_COUNT
 };
 struct kp_descriptor { const char *id, *description; };
 static const struct kp_descriptor kp_catalog[KP_COUNT] = {
@@ -32,6 +32,7 @@ static const struct kp_descriptor kp_catalog[KP_COUNT] = {
     {"vm-map-protection", "legacy vm_map maximum-protection guard"},
     {"amfi-vnode-validation", "legacy AMFI vnode-signature validation"},
     {"legacy-cs-validation", "legacy code-signature result path"},
+    {"nand-preserve", "Reject automatic NAND migration and formatting during ramdisk boot"}
 };
 enum kp_status { KP_PENDING, KP_PLANNED, KP_ALREADY, KP_ABSENT, KP_UNSUPPORTED, KP_FAILED };
 struct kp_result { enum kp_status status; const char *reason; size_t matches, changes; };

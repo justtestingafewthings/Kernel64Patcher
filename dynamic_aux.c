@@ -438,6 +438,22 @@ static int da_roothash(struct kd_ctx *c) {
     return kd_add_word(c,entry,0x14000000u|((uint32_t)(delta/4)&0x03ffffffu),label);
 }
 
+/* Register restores can separate the policy-byte load from its bit test. */
+static int da_policy_byte(const struct kd_ctx *c,size_t branch,size_t fn) {
+    unsigned tested=kd_word(c,branch)&31;
+    uint32_t restored=0;
+    for(size_t n=4;n<=16 && branch>=fn+n;n+=4) {
+        uint32_t w=kd_word(c,branch-n);
+        unsigned reg=w&31;
+        if((w&0xffc00000u)==0x39400000u)
+            return (reg==tested || tested==31) && !(restored&(1u<<reg));
+        /* Only independent scalar restores from SP may intervene. */
+        if((w&0xbfc003e0u)!=0xb94003e0u || reg<19 || reg>28) return 0;
+        restored|=1u<<reg;
+    }
+    return 0;
+}
+
 /* Bypass the encryption-policy panic edge while preserving normal cleanup. */
 static int da_unencrypted(struct kd_ctx *c) {
     const char *label = "unencrypted data-volume panic guard";
@@ -458,21 +474,39 @@ static int da_unencrypted(struct kd_ctx *c) {
             size_t string_target;
             if (!kd_address(c, ref, &string_register, &string_target) ||
                 string_register != 0 || string_target != strings[s]) return da_fail(label);
-            size_t lo = ref > 128 ? ref - 128 : fn;
-            if (lo < fn + 4) lo = fn + 4;
+            /* iOS 16 can place the panic in a distant cold block. */
+            if(ref-fn>0x20000) return da_fail(label);
+            size_t lo = fn + 4;
             for (size_t p = lo; p + 8 <= ref; p += 4) {
-                uint32_t op = kd_word(c, p), load = kd_word(c, p - 4);
-                /* TBNZ Wn,#0 follows a byte load of that policy flag. */
-                if ((op & 0xfff80000u) != 0x37000000u ||
-                    (load & 0xffc00000u) != 0x39400000u ||
-                    ((load & 31) != (op & 31) && (op & 31) != 31)) continue;
+                uint32_t op = kd_word(c, p);
+                /* TBNZ enters an outlined panic; TBZ skips an inline panic. */
+                if ((op & 0xfef80000u) != 0x36000000u ||
+                    !da_policy_byte(c,p,fn)) continue;
                 size_t target = kd_branch(c, p);
+                if((op & 0x01000000u)==0) {
+                    size_t call=ref+((kd_word(c,ref)&0x9f000000u)==0x90000000u?8:4);
+                    if(target==KD_NONE ||
+                       (target>=p && (target<call+4 || target>call+16)) ||
+                       kd_function(c,target)!=fn ||
+                       !da_linear(c,p+4,ref)) continue;
+                    if(site!=KD_NONE && site!=p) return da_fail(label);
+                    site=p;
+                    continue;
+                }
                 if (target == KD_NONE || target <= p + 4 ||
                     !da_linear(c, target, ref) || kd_function(c, p) != fn) continue;
                 int returned = 0, valid = 1;
                 for (size_t q = p + 4; q < target; q += 4) {
                     uint32_t w = kd_word(c, q);
                     if (da_ret(w)) { returned = 1; break; }
+                    /* A shared cleanup block replaces the inline return. */
+                    if(q==p+8 && da_b(w) &&
+                       (kd_word(c,p+4)&0xffffffe0u)==0x52800000u &&
+                       (kd_word(c,p+4)&31)>=19 && (kd_word(c,p+4)&31)<=28) {
+                        size_t cleanup=kd_branch(c,q);
+                        returned=cleanup!=KD_NONE && cleanup<p && kd_function(c,cleanup)==fn;
+                        break;
+                    }
                     if (da_bl(w) || da_b(w) ||
                         (w & 0x7e000000u) == 0x34000000u ||
                         (w & 0x7e000000u) == 0x36000000u ||

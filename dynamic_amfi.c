@@ -218,6 +218,112 @@ static int ka_prior_trust_stub(const struct kd_ctx *ctx,size_t anchor) {
     size_t start=anchor>512?anchor-512:0;
     return ka_trust_stub(ctx,start,anchor,2) || ka_trust_stub(ctx,start,anchor,3);
 }
+/* iOS 10 AMFI returns a Boolean after searching 20-byte trust-cache hashes. */
+static int ka_boolean_trust_caller(const struct kd_ctx *ctx,
+                                   const struct ka_scope *scope,size_t fn) {
+    const char message[]="Binary in trust cache, but has no platform entitlement.";
+    size_t call=KD_NONE;
+    for(size_t q=scope->code;q+96<=scope->code_end;q+=4) {
+        if((kd_word(ctx,q)&0xfc000000)!=0x94000000 || kd_branch(ctx,q)!=fn ||
+           (kd_word(ctx,q+4)&0x7f00001f)!=0x34000000) continue;
+        for(size_t a=q+8;a<q+96;a+=4) {
+            size_t string;
+            if(kd_address(ctx,a,NULL,&string) &&
+               string>=scope->text && string-scope->text<scope->text_size &&
+               ctx->len-string>=sizeof(message) &&
+               !memcmp(ctx->buf+string,message,sizeof(message)-1)) {
+                if(ka_unique(&call,q)) return 0;
+            }
+        }
+    }
+    return call!=KD_NONE;
+}
+static size_t ka_boolean_trust_query(const struct kd_ctx *ctx,
+                                      const struct ka_scope *scope,int *already) {
+    size_t selected=KD_NONE;
+    for(size_t p=scope->code;p+92<=scope->code_end;p+=4) {
+        if(kd_word(ctx,p)==0x52800020 && kd_word(ctx,p+4)==0xd65f03c0 &&
+           ka_boolean_trust_caller(ctx,scope,p)) {
+            if(ka_unique(&selected,p)) return KD_NONE;
+            *already=1;
+            continue;
+        }
+        int original=kd_word(ctx,p)==0x52800282 && /* mov w2, #20 */
+           kd_word(ctx,p+4)==0xaa1303e0 && /* mov x0, x19 */
+           kd_word(ctx,p+8)==0xaa1403e1 && /* mov x1, x20 */
+           (kd_word(ctx,p+12)&0xfc000000)==0x94000000 &&
+           (kd_word(ctx,p+16)&0x7f00001f)==0x34000000 &&
+           kd_branch(ctx,p+16)==p+56 && /* found entry */
+           kd_word(ctx,p+48)==0x52800013 && /* no match: mov w19, #0 */
+           kd_word(ctx,p+56)==0x320003f3 && /* match: orr w19, wzr, #1 */
+           kd_word(ctx,p+68)==0xaa1303e0 && /* return Boolean in x0 */
+           kd_word(ctx,p+88)==0xd65f03c0;
+        /* A10 iOS 10 and A11 iOS 11 compute the hash address before
+         * setting up memcmp. Follow both loops and the Boolean result. */
+        int indexed=kd_word(ctx,p)==0x91007101 && /* add x1, x8, #28 */
+           kd_word(ctx,p+4)==0x52800282 && kd_word(ctx,p+8)==0xaa1303e0 &&
+           (kd_word(ctx,p+12)&0xfc000000)==0x94000000 &&
+           kd_executable(ctx,kd_branch(ctx,p+12)) &&
+           (kd_word(ctx,p+16)&0xff00001f)==0x34000000 && kd_branch(ctx,p+16)==p+52 &&
+           kd_word(ctx,p+20)==0x110006f7 && /* next hash */
+           kd_word(ctx,p+24)==0xb9401aa8 && kd_word(ctx,p+28)==0x6b0802ff &&
+           (kd_word(ctx,p+32)&0xff00001f)==0x54000003 &&
+           ((p>=8 && kd_branch(ctx,p+32)==p-8 && kd_word(ctx,p-8)==0x2a1703e8 &&
+             kd_word(ctx,p-4)==0x9b165508) ||
+            (p>=4 && kd_branch(ctx,p+32)==p-4 && kd_word(ctx,p-4)==0x9bb656e8)) &&
+           kd_word(ctx,p+36)==0xf94002b5 && /* next trust-cache module */
+           (kd_word(ctx,p+40)&0xff00001f)==0xb5000015 &&
+           kd_branch(ctx,p+40)<p && p-kd_branch(ctx,p+40)<=32 &&
+           kd_word(ctx,kd_branch(ctx,p+40))==0xb9401aa8 &&
+           kd_word(ctx,p+44)==0x52800013 && kd_branch(ctx,p+48)==p+56 &&
+           (kd_word(ctx,p+48)&0xfc000000)==0x14000000 &&
+           kd_word(ctx,p+52)==0x320003f3 &&
+           (kd_word(ctx,p+56)&0xffc003ff)==0xf9400280 &&
+           (kd_word(ctx,p+60)&0xfc000000)==0x94000000 &&
+           kd_executable(ctx,kd_branch(ctx,p+60)) &&
+           kd_word(ctx,p+64)==0xaa1303e0 && kd_word(ctx,p+84)==0xd65f03c0;
+        if(!original && !indexed) continue;
+        if(*already) {
+            if(p>=selected && p-selected<=256) continue;
+            return KD_NONE;
+        }
+        size_t fn=kd_function(ctx,p);
+        if(fn==KD_NONE || fn>=p || p-fn>256 || kd_function(ctx,fn)!=fn) continue;
+        if(!ka_boolean_trust_caller(ctx,scope,fn)) return KD_NONE;
+        if(ka_unique(&selected,fn)) return KD_NONE;
+    }
+    return selected;
+}
+
+/* Early iOS 16 calls a frameless PPL selector stub instead of a function
+ * prologue. Tie that entry to the packed trust flags and failure diagnostic,
+ * and require its neighboring selectors to share the same dispatcher. */
+static int ka_ppl_trust_entry(const struct kd_ctx *ctx,const struct ka_scope *scope,
+                              size_t flags,size_t entry) {
+    static const char diagnostic[]="%s: token is untrusted: hash does not match\n";
+    if(flags>scope->code_end || scope->code_end-flags<48 || entry<8 ||
+       !kd_executable(ctx,entry-8) || !kd_executable(ctx,entry+12) ||
+       kd_word(ctx,flags+4)!=0x6a20011f || /* bics wzr,w8,w0 */
+       (kd_word(ctx,flags+8)&0xff00001f)!=0x54000001 ||
+       kd_branch(ctx,flags+8)!=flags+28) return 0;
+    unsigned argument;
+    size_t text;
+    if(!kd_address(ctx,flags+40,&argument,&text) || argument!=0 ||
+       text<scope->text || text-scope->text>=scope->text_size ||
+       scope->text_size-(text-scope->text)<sizeof(diagnostic) ||
+       ctx->len-text<sizeof(diagnostic) || memcmp(ctx->buf+text,diagnostic,sizeof(diagnostic))) return 0;
+    if((kd_word(ctx,entry-8)&0xffe0001f)!=0xd280000f ||
+       (kd_word(ctx,entry+8)&0xffe0001f)!=0xd280000f ||
+       (kd_word(ctx,entry-4)&0xfc000000)!=0x14000000 ||
+       (kd_word(ctx,entry+12)&0xfc000000)!=0x14000000) return 0;
+    size_t dispatcher=kd_branch(ctx,entry-4);
+    if(!kd_executable(ctx,dispatcher) || dispatcher!=kd_branch(ctx,entry+12) ||
+       (dispatcher>=scope->code && dispatcher<scope->code_end)) return 0;
+    return ((kd_word(ctx,entry)&0xffe0001f)==0xd280000f &&
+            (kd_word(ctx,entry+4)&0xfc000000)==0x14000000 && kd_branch(ctx,entry+4)==dispatcher) ||
+           (kd_word(ctx,entry)==0xd2802020 && kd_word(ctx,entry+4)==0xd65f03c0);
+}
+
 static int ka_trust(struct kd_ctx *ctx, const struct ka_scope *scope, int *modern, int emit) {
     size_t selected = KD_NONE, old = KD_NONE;
     unsigned selected_argument = 0;
@@ -279,7 +385,8 @@ static int ka_trust(struct kd_ctx *ctx, const struct ka_scope *scope, int *moder
                     call -= 4;
                 if ((kd_word(ctx, call) & 0xfc000000) != 0x94000000) continue;
                 size_t fn = ka_follow(ctx, kd_branch(ctx, call));
-                if (fn == KD_NONE || kd_function(ctx, fn) != fn) continue;
+                if (fn == KD_NONE || (kd_function(ctx, fn) != fn &&
+                    !ka_ppl_trust_entry(ctx,scope,p,fn))) continue;
                 if (ka_unique(&old, fn)) old_ambiguous = 1;
             }
         }
@@ -305,6 +412,21 @@ static int ka_trust(struct kd_ctx *ctx, const struct ka_scope *scope, int *moder
         const uint32_t patch[] = {0xd2802020, 0xd65f03c0};
         *modern = 0;
         return emit?kd_add(ctx, old, patch, sizeof(patch), "AMFI legacy trust-query flags"):0;
+    }
+    int boolean_already=0;
+    size_t boolean=ka_boolean_trust_query(ctx,scope,&boolean_already);
+    if(boolean!=KD_NONE) {
+        if(boolean_already) {
+            *modern=0;
+            if(emit) {
+                kp.results[kp.active].status=KP_ALREADY;
+                kp.results[kp.active].reason="Validated AMFI Boolean trust-cache query already patched";
+            }
+            return 0;
+        }
+        const uint32_t patch[]={0x52800020,0xd65f03c0};
+        *modern=0;
+        return emit?kd_add(ctx,boolean,patch,sizeof(patch),"AMFI Boolean trust-cache query"):0;
     }
     return ka_fail("unable to validate trust-cache query ABI");
 }

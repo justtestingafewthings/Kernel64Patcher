@@ -637,12 +637,14 @@ static int ka_developer_body(const struct kd_ctx *ctx, size_t p, int enabled, ui
         return *slot != KD_NONE && kd_executable(ctx, *slot);
     }
     uint32_t page = first, load = kd_word(ctx, p + 4);
-    if ((page & 0x9f000000) != 0x90000000 || (load & 0xffc00000) != 0xf9400000 ||
+    int direct = (load & 0xffc00000) == 0x91000000; /* adrp/add; stlrb */
+    if ((page & 0x9f000000) != 0x90000000 ||
+        (!direct && (load & 0xffc00000) != 0xf9400000) ||
         ((load >> 5) & 31) != (page & 31)) return 0;
     uint32_t bits = ((page >> 5) & 0x7ffff) << 2 | ((page >> 29) & 3);
     int64_t pages = (int64_t)(bits & 0x1fffff) - ((bits & 0x100000) ? 0x200000 : 0);
     uint64_t address = (kd_va(ctx, p) & ~UINT64_C(0xfff)) + pages * 4096 +
-                       ((load >> 10) & 0xfff) * 8;
+                       ((load >> 10) & 0xfff) * (direct ? 1 : 8);
     *slot = kd_offset(ctx, address);
     if (*slot == KD_NONE || kd_executable(ctx, *slot)) return 0;
     size_t store = p + 8;
@@ -654,6 +656,13 @@ static int ka_developer_body(const struct kd_ctx *ctx, size_t p, int enabled, ui
         store += 4;
     }
     uint32_t op = kd_word(ctx, store);
+    if (direct) {
+        /* Older ARM64 kernels store the shared Boolean with release ordering. */
+        if (op != (0x089ffc00u | ((load & 31) << 5) | value) ||
+            kd_word(ctx, store + 4) != 0xd65f03c0) return 0;
+        *field = 0;
+        return 1;
+    }
     if ((op & 0xffc00000) != 0x39000000 || ((op >> 5) & 31) != (load & 31) ||
         (op & 31) != value || kd_word(ctx, store + 4) != 0xd65f03c0) return 0;
     *field = (op >> 10) & 0xfff;
@@ -675,9 +684,10 @@ static int ka_developer_setter(const struct kd_ctx *ctx, size_t p, int enabled,
     if(original==0x52800020u) original=0x52800000u;
     else if((original&0x9f000000u)==0x90000000u) {
         uint32_t load=kd_word(ctx,p+4);
-        if((load&0xffc00000u)!=0xf9400000u) return 0;
+        int direct=(load&0xffc00000u)==0x91000000u;
+        if(!direct && (load&0xffc00000u)!=0xf9400000u) return 0;
         uint64_t address=kd_va(ctx,shared), pc=kd_va(ctx,p);
-        uint64_t displacement=((load>>10)&4095u)*8u;
+        uint64_t displacement=((load>>10)&4095u)*(direct?1u:8u);
         if(address==UINT64_MAX || pc==UINT64_MAX || address<displacement) return 0;
         address-=displacement;
         if(address&4095u) return 0;

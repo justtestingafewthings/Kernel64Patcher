@@ -323,7 +323,10 @@ static int da_auth_entry(const struct kd_ctx *c,size_t p,size_t target) {
     if(cmp!=(0xf100001fu|(value<<5)) ||
        sel!=(0x9a800000u|(value<<16)|(object<<5)) || object<19 || object>28) return 0;
     if((arg&0xffe0ffffu)!=0xaa0003e1u && arg!=0x52800001u && arg!=0xd2800001u) return 0;
-    return da_bl(kd_word(c,p+16)) && kd_executable(c,kd_branch(c,p+16));
+    size_t call=p+16;
+    /* iOS 15 also passes a second zero mode argument in W2. */
+    if(kd_word(c,call)==0x52800002u || kd_word(c,call)==0xd2800002u) call+=4;
+    return da_bl(kd_word(c,call)) && kd_executable(c,kd_branch(c,call));
 }
 static int da_roothash(struct kd_ctx *c) {
     const char *label="personalized root-hash authentication";
@@ -331,6 +334,48 @@ static int da_roothash(struct kd_ctx *c) {
            ns=da_strings(c,"successfully validated on-disk root hash",successes,8);
     if(nf==KD_NONE||ns==KD_NONE) return da_fail(label);
     if(!nf&&!ns&&c->xnu<8019) { kp_absent("personalized root-hash authentication is absent"); return 0; }
+    if(!nf && ns==1 && c->xnu<8019) {
+        /* iOS/tvOS 14 logs this failure and skips verification. Both outcomes
+         * must use returning wrappers of the same logger. A success log alone
+         * does not establish the presence of the later fatal check. */
+        size_t skipped[8],refs[2][8],n=da_strings(c,
+            "could not authenticate personalized root hash, skipping verification",skipped,8);
+        if(n!=1 || da_refs(c,skipped[0],refs[0],8)!=1 ||
+           da_refs(c,successes[0],refs[1],8)!=1) return da_fail(label);
+        size_t fn=kd_function(c,refs[0][0]),logger=KD_NONE;
+        if(fn==KD_NONE || kd_function(c,refs[1][0])!=fn) return da_fail(label);
+        for(unsigned i=0;i<2;i++) {
+            size_t ref=refs[i][0],string,call;
+            unsigned reg;
+            if(!kd_address(c,ref,&reg,&string) || reg!=0 ||
+               string!=(i?successes[0]:skipped[0]) || c->buf[string]=='"') return da_fail(label);
+            call=ref+((kd_word(c,ref)&0x9f000000u)==0x90000000u?8:4);
+            if(da_b(kd_word(c,call))) call=kd_branch(c,call);
+            if(!kd_executable(c,call) || kd_function(c,call)!=fn ||
+               !da_bl(kd_word(c,call)) || !kd_executable(c,kd_branch(c,call))) return da_fail(label);
+            size_t wrapper=kd_branch(c,call),print=KD_NONE,last_branch=wrapper;
+            int returned=0;
+            if(kd_function(c,wrapper)!=wrapper) return da_fail(label);
+            for(size_t q=wrapper;q<wrapper+96 && kd_function(c,q)==wrapper;q+=4) {
+                uint32_t op=kd_word(c,q);
+                if(da_ret(op)) { returned=q>=last_branch;break; }
+                if(da_b(op) || (op&0xfe000000u)==0xd6000000u) return da_fail(label);
+                if(da_bl(op)) {
+                    if(print!=KD_NONE || !kd_executable(c,kd_branch(c,q))) return da_fail(label);
+                    print=kd_branch(c,q);
+                } else {
+                    size_t target=kd_branch(c,q);
+                    if(target!=KD_NONE) {
+                        if(target<=q || target>=wrapper+96 || kd_function(c,target)!=wrapper) return da_fail(label);
+                        if(target>last_branch) last_branch=target;
+                    }
+                }
+            }
+            if(!returned || print==KD_NONE || (logger!=KD_NONE && logger!=print)) return da_fail(label);
+            logger=print;
+        }
+        kp_absent("Personalized root-hash authentication failure is nonfatal"); return 0;
+    }
     if(nf!=1||ns!=1) return da_fail(label);
     size_t fr[8],sr[8],nfr=da_refs(c,fails[0],fr,8),nsr=da_refs(c,successes[0],sr,8);
     if(nfr!=1||nsr!=1) return da_fail(label);

@@ -21,7 +21,7 @@ Flags can be combined:
 
 - `-a`: Patch AMFI.
 - `-f`: Bypass AppleFirmwareUpdate IMG4 signature validation.
-- `-s`: Bypass the SPU firmware-validation failure guard (iOS 15+).
+- `-s`: Bypass the SPU firmware-validation failure guard.
 - `-p`: Bypass the AMFI local-signing-key acquisition panic (iOS 15+).
 - `-u`: Bypass the unencrypted data-volume panic guard.
 - `-r`: Bypass the rootvp authentication panic (iOS 15+).

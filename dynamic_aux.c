@@ -195,6 +195,95 @@ static int da_firmware(struct kd_ctx *c) {
     return 0;
 }
 
+/* Early SPU builds keep the panic inline. A zero validation status skips
+ * the panic call; its nonzero value is also the diagnostic's second argument.
+ * The intervening getName virtual call may use arm64e pointer authentication. */
+static int da_spu_inline_guard(const struct kd_ctx *c,size_t reference,
+                                size_t *sites,size_t *count,size_t capacity) {
+    size_t fn=kd_function(c,reference),string;
+    unsigned reg;
+    if(fn==KD_NONE || reference<fn+4 ||
+       !kd_address(c,reference,&reg,&string) || reg!=0 || c->buf[string]!='"') return 0;
+    size_t call=reference+((kd_word(c,reference)&0x9f000000u)==0x90000000u?8:4);
+    if(!da_bl(kd_word(c,call)) || !kd_executable(c,kd_branch(c,call)) ||
+       !kd_executable(c,call+4) || kd_function(c,call+4)!=fn) return 0;
+    uint32_t args=kd_word(c,reference-4);
+    unsigned status;
+    if((args&0xffff83ffu)==0xa90003e0u) status=(args>>10)&31; /* stp x0,xN,[sp] */
+    else if((args&0xffffffe0u)==0xf90007e0u) status=args&31; /* str xN,[sp,#8] */
+    else return 0;
+    if(status<19 || status>28) return 0; /* preserved across getName */
+    size_t lo=reference>128?reference-128:fn,site=KD_NONE;
+    if(lo<fn) lo=fn;
+    for(size_t p=lo;p<reference;p+=4) {
+        uint32_t w=kd_word(c,p);
+        if((w&0xff000000u)!=0x34000000u || /* cbz wN, continuation */
+           kd_branch(c,p)!=call+4) continue;
+        if((w&31)!=status && (w&31)!=31) {
+            /* Some callbacks test the incoming W1 after saving it for the
+             * diagnostic. Only independent register saves may intervene. */
+            if((w&31)!=1) continue;
+            int saved=0;
+            for(size_t n=4;n<=16 && p>=fn+n;n+=4) {
+                uint32_t move=kd_word(c,p-n);
+                unsigned dest=move&31;
+                if((move&0x7fe0ffe0u)!=0x2a0003e0u || dest<19 || dest>28) break;
+                if(dest==status) { saved=((move>>16)&31)==1;break; }
+            }
+            if(!saved) continue;
+        }
+        int valid=1;
+        for(size_t q=p+4;q<reference;q+=4) {
+            uint32_t op=kd_word(c,q);
+            if(da_b(op) || (op&0x7e000000u)==0x34000000u ||
+               (op&0x7e000000u)==0x36000000u || (op&0xff000010u)==0x54000000u) { valid=0;break; }
+            /* Register branches must be calls, including BLRAA/BLRAB. */
+            if((op&0xfe000000u)==0xd6000000u &&
+               (op&0xfffffc1fu)!=0xd63f0000u &&
+               (op&0xfffff800u)!=0xd73f0800u &&
+               (op&0xfffffbffu)!=0xd63f081fu) { valid=0;break; }
+        }
+        if(!valid || kd_function(c,p)!=fn) continue;
+        if(site!=KD_NONE) return -1;
+        site=p;
+    }
+    return site==KD_NONE?0:da_unique(sites,count,capacity,site);
+}
+
+/* iOS 10 SPU dispatches validation statuses before processing the bundle.
+ * Its ordinary error log is followed by a separate missing-firmware panic. */
+static int da_spu_status_guard(const struct kd_ctx *c,size_t reference,
+                                size_t *sites,size_t *count,size_t capacity) {
+    size_t fn=kd_function(c,reference),string;
+    unsigned reg;
+    if(fn==KD_NONE || reference<fn+20 || reference-fn>96 ||
+       !kd_address(c,reference,&reg,&string) || reg!=0 ||
+       c->len-string<sizeof("AppleSPUFirmwareService: firmware validation failed") ||
+       memcmp(c->buf+string,"AppleSPUFirmwareService: firmware validation failed",
+              sizeof("AppleSPUFirmwareService: firmware validation failed")-1)) return 0;
+    size_t guard=reference-20,success=reference+16;
+    uint32_t w=kd_word(c,guard);
+    if((w&0xff000000u)!=0x34000000u || ((w&31)!=1 && (w&31)!=31) ||
+       kd_branch(c,guard)!=success || kd_word(c,guard+4)!=0x7100043fu ||
+       (kd_word(c,guard+8)&0xff00001fu)!=0x54000000u ||
+       kd_word(c,guard+12)!=0x7100083fu ||
+       (kd_word(c,guard+16)&0xff00001fu)!=0x54000001u ||
+       !da_bl(kd_word(c,reference+8)) || !kd_executable(c,kd_branch(c,reference+8)) ||
+       !da_b(kd_word(c,reference+12)) || kd_word(c,success)!=0xaa0303e0u ||
+       !da_bl(kd_word(c,success+4)) || !kd_executable(c,kd_branch(c,success+4)) ||
+       kd_function(c,guard)!=fn || kd_function(c,success)!=fn) return 0;
+    size_t cleanup=kd_branch(c,reference+12);
+    if(cleanup==KD_NONE || cleanup<=success || kd_function(c,cleanup)!=fn) return 0;
+    for(size_t p=guard+8;p<=guard+16;p+=8) {
+        size_t log=kd_branch(c,p),text;
+        if(log==KD_NONE || log<=success || log>=cleanup ||
+           !kd_address(c,log,&reg,&text) || reg!=0 ||
+           kd_branch(c,log+8)!=kd_branch(c,reference+8) ||
+           !da_bl(kd_word(c,log+8))) return 0;
+    }
+    return da_unique(sites,count,capacity,guard);
+}
+
 static int da_spu(struct kd_ctx *c) {
     const char *label="SPU firmware-validation failure guard";
     size_t strings[8],sites[16],count=0;
@@ -211,7 +300,10 @@ static int da_spu(struct kd_ctx *c) {
         if(nr==KD_NONE||!nr) return da_fail(label);
         for(size_t r=0;r<nr;r++) {
             size_t local[16],nlocal=0;
-            if(da_indirect_guards(c,refs[r],local,&nlocal,16,0)<0 || !nlocal) return da_fail(label);
+            if(da_spu_status_guard(c,refs[r],local,&nlocal,16)<0 ||
+               da_spu_inline_guard(c,refs[r],local,&nlocal,16)<0 ||
+               da_guards(c,refs[r],local,&nlocal,16,0)<0 ||
+               da_indirect_guards(c,refs[r],local,&nlocal,16,0)<0 || !nlocal) return da_fail(label);
             for(size_t i=0;i<nlocal;i++)
                 if(da_unique(sites,&count,16,local[i])<0) return da_fail(label);
         }

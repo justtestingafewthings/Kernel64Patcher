@@ -44,7 +44,7 @@ static void usage(const char *program) {
     fprintf(stderr, "Usage: %s <kernel_in> <kernel_out> <args>\n", program);
     fprintf(stderr, "\t-a\t\tPatch AMFI\n");
     fprintf(stderr, "\t-f\t\tPatch AppleFirmwareUpdate img4 signature check\n");
-    fprintf(stderr, "\t-s\t\tPatch SPU firmware-validation failure (iOS 15+)\n");
+    fprintf(stderr, "\t-s\t\tPatch SPU firmware-validation failure\n");
     fprintf(stderr, "\t-r\t\tPatch rootvp authentication panic (iOS 15+)\n");
     fprintf(stderr, "\t-o\t\tPatch personalized root-hash authentication (iOS 15+)\n");
     fprintf(stderr, "\t-p\t\tPatch AMFI local-signing-key panic (iOS 15+)\n");

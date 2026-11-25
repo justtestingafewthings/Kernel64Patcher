@@ -562,9 +562,13 @@ static int da_apfs_mount_auth(struct kd_ctx *c) {
                 uint32_t cmp = kd_word(c, p);
                 if ((cmp != 0xeb08001fu && cmp != 0xeb00001fu) ||
                     kd_function(c, p) != fn || p < 12 ||
-                    (kd_word(c, p - 4) & 0xffc003ffu) != 0xf9400108u ||
-                    (kd_word(c, p - 8) & 0xffc003ffu) != 0xf9400108u ||
-                    (kd_word(c, p - 12) & 0x9f00001fu) != 0x90000008u)
+                    (kd_word(c, p - 4) & 0xffc003ffu) != 0xf9400108u)
+                    continue;
+                /* Early APFS inserts a NOP; later kernels dereference x8 twice. */
+                uint32_t prior = kd_word(c, p - 8);
+                size_t adrp = (prior == 0xd503201fu ||
+                    (prior & 0xffc003ffu) == 0xf9400108u) ? p - 12 : p - 8;
+                if ((kd_word(c, adrp) & 0x9f00001fu) != 0x90000008u)
                     continue;
                 if (local != KD_NONE && local != p) return da_fail(label);
                 local = p;

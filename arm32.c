@@ -14,6 +14,8 @@ static uint32_t read_be32(const unsigned char *p) {
            (uint32_t)p[2] << 8 | p[3];
 }
 
+#include "nvram.h"
+
 /* Discover ARM32 kernel policy and kext paths from Mach-O metadata and code. */
 #define WK_MAX_MAPS 32
 #define WK_MAX_MODULES 256
@@ -736,6 +738,27 @@ static int wk_failure(struct wk_image *im,const char *anchor,const char *name,in
 #include "nand.c"
 #include "nor_read.c"
 
+static int wk_nvram(struct wk_image *im) {
+    struct nv_image *nv=calloc(1,sizeof(*nv));
+    if(!nv) return -1;
+    nv->buf=im->b;nv->len=im->len;nv->pointer_size=4;
+    /* wk_open already validated the top-level segment extents. */
+    size_t p=28;
+    for(uint32_t i=0;i<read_le32(im->b+16);i++) {
+        uint32_t cmd=read_le32(im->b+p),size=read_le32(im->b+p+4);
+        if(cmd==1 && read_le32(im->b+p+36)) {
+            if(nv->map_count==1024) { free(nv);return -1; }
+            nv->maps[nv->map_count++]=(struct nv_map){read_le32(im->b+p+32),
+                read_le32(im->b+p+36),read_le32(im->b+p+24),!memcmp(im->b+p+8,"__DATA",6)};
+        }
+        p+=size;
+    }
+    struct nv_table table;
+    int rc=nv_find(nv,0,&table);
+    if(!rc) rc=nv_legacy(nv,&table);
+    free(nv);return rc;
+}
+
 static int patch_arm32_kernel(unsigned char *buf,size_t len,uint64_t selection) {
     struct wk_image im;
     if(wk_open(&im,buf,len)) { fprintf(stderr,"Invalid or unsupported ARM Mach-O kernel metadata.\n");return -1; }
@@ -772,6 +795,7 @@ static int patch_arm32_kernel(unsigned char *buf,size_t len,uint64_t selection) 
         case KP_LEGACY_CS_VALIDATION:rc=wk_legacy_cs_validation(&im);break;
         case KP_NAND_PRESERVE:rc=wk_nand_preserve(&im);break;
         case KP_NOR_READ_BRIDGE:rc=wk_nor_read_bridge(&im);break;
+        case KP_NVRAM_KERNEL_ONLY:rc=wk_nvram(&im);break;
         default:rc=-1;break;
         }
         if(kp_finish(rc)) failed=1;

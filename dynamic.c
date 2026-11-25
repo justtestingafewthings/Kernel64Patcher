@@ -276,6 +276,7 @@ static int kd_init(struct kd_ctx *c,unsigned char *buf,size_t len) {
 #include "dynamic_amfi.c"
 #include "dynamic_aux.c"
 #include "storage_keys.c"
+#include "nvram.c"
 
 static int patch_dynamic_kernel(unsigned char *buf,size_t len,uint64_t selection) {
     struct kd_ctx *c=calloc(1,sizeof(*c));
@@ -289,6 +290,7 @@ static int patch_dynamic_kernel(unsigned char *buf,size_t len,uint64_t selection
         if(id<=KP_DEVELOPER_MODE) rc=kd_amfi_patch(c,(enum kp_id)id);
         else if(id<=KP_UNENCRYPTED) rc=kd_aux(c,1<<(id-KP_FIRMWARE+1));
         else if(id==KP_STORAGE_KEYS) rc=sk_storage_keys(c);
+        else if(id==KP_NVRAM_KERNEL_ONLY) rc=kd_nvram(c);
         else if(id==KP_APFS_MOUNT_AUTH) rc=da_apfs_mount_auth(c);
         else if(id==KP_APFS_REMOUNT) rc=da_apfs_remount(c);
         else if(id==KP_FAIRPLAY_VALIDATION) {

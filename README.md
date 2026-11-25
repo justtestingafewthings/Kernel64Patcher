@@ -32,6 +32,7 @@ Flags can be combined:
 - `--vm-map-protection`: Bypass the validated legacy `vm_map` maximum-protection guard.
 - `--amfi-vnode-validation`: Bypass the validated legacy AMFI vnode-signature checks.
 - `--legacy-cs-validation`: Bypass the validated legacy code-signature result path.
+- `--nvram-kernel-only`: Permit reads and writes of kernel-only NVRAM variables.
 - `--nand-preserve`: Reject automatic NAND epoch/signature migration and formatting when booting SSH ramdisks on devices older than A5.
 - `--dry-run`: Report changes without writing a kernel.
 - `--report <path>`: Write a JSON report with patch status, file offsets, virtual addresses and original/replacement bytes.

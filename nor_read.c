@@ -198,18 +198,26 @@ static int nor_early_physical_1504_verified(const struct wk_image *im,
 }
 static int nor_early_bridge(const struct wk_image *im) {
     struct wk_module module;
-    if(im->xnu<1228) return kp_unsupported("Image3 NOR client is unavailable");
-    if(nor_class_module(im,&module,"AppleImage3NORAccessUserClient"))
+    int image2=im->xnu<1228;
+    const char *class_name=image2 ? "AppleImage2NORAccessUserClient" :
+                                     "AppleImage3NORAccessUserClient";
+    if(nor_class_module(im,&module,class_name))
         return kp_unsupported("Early NOR user client was not uniquely identified");
-    size_t original=nor_early_dispatcher(im,module.text);
+    size_t original=image2 ?
+        wk_symbol(im,"__ZN12IOUserClient14externalMethodEjP25IOExternalMethodArgumentsP24IOExternalMethodDispatchP8OSObjectPv") :
+        nor_early_dispatcher(im,module.text);
     if(original==SIZE_MAX) return kp_unsupported("Early NOR externalMethod dispatcher was not identified");
-    uint32_t old_method=wk_va(im,original)|(im->xnu>=1357 ? 1u:0u);
+    uint32_t old_method=wk_va(im,original)|(image2 || im->xnu>=1357 ? 1u:0u);
     size_t slot=nor_vtable_slot(im,module,old_method);
     if(slot==SIZE_MAX) return kp_unsupported("Early NOR externalMethod vtable slot was not identified");
     const unsigned char *stub=NULL;size_t stub_size=0;
     if(im->subtype!=6 && im->subtype!=9 && im->subtype!=11)
         return kp_unsupported("Early NOR bridge CPU subtype was not identified");
-    if(im->xnu<1357) {
+    if(image2) {
+        if(im->subtype!=6)
+            return kp_unsupported("Image2 NOR bridge requires an ARMv6 kernel");
+        stub=nor_read_arm_4;stub_size=sizeof nor_read_arm_4;
+    } else if(im->xnu<1357) {
         if(im->subtype==6) {stub=nor_read_arm_0_v6;stub_size=sizeof nor_read_arm_0_v6;}
         else {stub=nor_read_arm_0;stub_size=sizeof nor_read_arm_0;}
     } else if(im->xnu<1504) {
@@ -254,7 +262,7 @@ static int nor_early_bridge(const struct wk_image *im) {
     int flash_bridge=flash_original!=SIZE_MAX && flash_slot!=SIZE_MAX &&
                      flash_nand!=SIZE_MAX && flash_wrap!=SIZE_MAX &&
                      flash_alloc!=SIZE_MAX && flash_free!=SIZE_MAX;
-    int physical_write=((im->xnu>=1357 && im->xnu<1504) ||
+    int physical_write=!image2 && ((im->xnu>=1357 && im->xnu<1504) ||
                                       (im->xnu==1504 && im->subtype==6) ||
                                       im->xnu==1735);
     if(im->xnu==1504 && im->subtype==6 &&
@@ -283,7 +291,7 @@ static int nor_early_bridge(const struct wk_image *im) {
         nor_u32(payload+32,cv+(uint32_t)stub_at);
         nor_u32(payload+36,old_method);
     } else {
-        nor_u32(payload+0,0xe3510004u);
+        nor_u32(payload+0,image2 ? 0xe3510005u:0xe3510004u);
         nor_u32(payload+4,0x1a000001u);  /* bne old method */
         nor_u32(payload+8,0xe59fc008u);  /* ldr ip,stub */
         nor_u32(payload+12,0xe12fff1cu); /* bx ip */
@@ -293,6 +301,33 @@ static int nor_early_bridge(const struct wk_image *im) {
         nor_u32(payload+28,old_method);
     }
     memcpy(payload+stub_at,stub,stub_size);
+    if(image2) {
+        size_t provider=wk_symbol(im,"__ZNK9IOService11getProviderEv");
+        size_t vtable=wk_symbol(im,"__ZTV22AppleARMNORFlashDevice");
+        size_t size_method=wk_symbol(im,"__ZN22AppleARMNORFlashDevice13getRegionSizeEm");
+        size_t read_method=wk_symbol(im,"__ZN22AppleARMNORFlashDevice10readRegionEmPhmm");
+        size_t size_slot=SIZE_MAX;
+        if(vtable!=SIZE_MAX && size_method!=SIZE_MAX && read_method!=SIZE_MAX) {
+            /* This early kernel stores the vtable symbol itself in the object. */
+            for(size_t off=0;off<0x800 && vtable+off+8<=im->len;off+=4)
+                if(read_le32(im->b+vtable+off)==(wk_va(im,size_method)|1u) &&
+                   read_le32(im->b+vtable+off+4)==(wk_va(im,read_method)|1u)) {
+                    if(size_slot!=SIZE_MAX) { size_slot=SIZE_MAX; break; }
+                    size_slot=off;
+                }
+        }
+        if(provider==SIZE_MAX || stub_size!=312 || read_le32(stub+0x90)!=0xe1a0200fu ||
+           read_le32(stub+0x134)!=0x13579bdfu ||
+           read_le32(stub+0xc0)!=0xe5902354u || read_le32(stub+0xc4)!=0xe5908358u ||
+           size_slot==SIZE_MAX || size_slot>0xffbu) {
+            free(payload);
+            return kp_unsupported("Image2 provider read methods were not validated");
+        }
+        uint32_t runtime_anchor=cv+32+0x98;
+        nor_u32(payload+32+0x134,(wk_va(im,provider)|1u)-runtime_anchor);
+        nor_u32(payload+32+0xc0,0xe5902000u|(uint32_t)size_slot);
+        nor_u32(payload+32+0xc4,0xe5908000u|(uint32_t)(size_slot+4));
+    }
     if(flash_bridge) {
         size_t at=flash_at+12;
         const unsigned char *early=nor_flash_early_thumb;
@@ -322,6 +357,39 @@ static int nor_early_bridge(const struct wk_image *im) {
     if(!failed && flash_bridge) {
         nor_u32(pointer,cv+(uint32_t)flash_at+1u);
         failed=kp_add(flash_slot,wk_va(im,flash_slot),pointer,4,"Flash Boot Block read method",1);
+    }
+    if(!failed && image2 && im->xnu==933) {
+        /* The 1.0 Image2 writer checks both the 8900 header MAC and the
+         * payload signature before parsing the plaintext 2gmI image.
+         * Permit a synthetic wrapper while retaining its length checks and
+         * the inner Image2 parser. Both sites must match this exact build. */
+        static const unsigned char header_mac_check[]={
+            0x98,0x00,0x98,0xe5, /* ldr r0,[r8,#0x98] */
+            0x00,0x00,0x50,0xe3, /* cmp r0,#0 */
+            0x00,0x50,0xa0,0x01, /* moveq r5,r0 */
+            0x27,0x00,0x00,0x0a  /* beq verified wrapper shape */
+        };
+        static const unsigned char signed_payload_check[]={
+            0x3c,0xff,0x2f,0xe1, /* blx ip: authenticate payload */
+            0x00,0x40,0xa0,0xe1, /* mov r4,r0: save result */
+            0x03,0x00,0x00,0xea, /* b cleanup */
+            0x00,0x00,0x5b,0xe3  /* cmp fp,#0 */
+        };
+        size_t header=nor_code_pattern(im,module.text,header_mac_check,
+                                       sizeof header_mac_check);
+        size_t check=nor_code_pattern(im,module.text,signed_payload_check,
+                                      sizeof signed_payload_check);
+        if(header==SIZE_MAX || check==SIZE_MAX)
+            failed=kp_unsupported("Image2 authentication sites were not uniquely identified");
+        else {
+            unsigned char accept[4];nor_u32(accept,0xe3a00000u); /* mov r0,#0 */
+            failed=kp_add(header,wk_va(im,header),accept,sizeof accept,
+                          "Image2 ramdisk wrapper MAC override",0);
+            nor_u32(accept,0xe3a04000u); /* mov r4,#0 */
+            if(!failed)
+                failed=kp_add(check+4,wk_va(im,check+4),accept,sizeof accept,
+                              "Image2 ramdisk payload signature override",0);
+        }
     }
     free(payload);
     return failed ? -1:0;

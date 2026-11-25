@@ -31,6 +31,9 @@
 #define PHYSICAL_READ_SLOT 0x358
 #define NAND_SIZE_SLOT 0x378
 #define NAND_READ_SLOT 0x37c
+#elif NOR_MODE == 4
+#define PHYSICAL_SIZE_SLOT 0x354
+#define PHYSICAL_READ_SLOT 0x358
 #else
 #error Unsupported NOR_MODE
 #endif
@@ -110,18 +113,25 @@ write_done:
         return result;
     }
 #endif
-    if(selector!=4u || !args || !args->structure_input ||
+    if(selector!=(NOR_MODE==4 ? 5u:4u) || !args || !args->structure_input ||
        args->structure_input_size!=sizeof(request) ||
        args->structure_input_descriptor || !args->structure_output || args->structure_output_descriptor)
         return 0xe00002c2u;
     const request *r=(const request *)args->structure_input;
     if(r->version!=1 || r->region>1 || r->length>(NOR_MODE==3 ? 256u:4096u) ||
        (r->length ? r->length : 4)>args->structure_output_size) return 0xe00002c2u;
+#if NOR_MODE == 4
+    uintptr_t anchor;
+    __asm__ volatile("mov %0, pc" : "=r"(anchor));
+    void *(*get_provider)(void *)=(void *(*)(void *))(anchor+0x13579bdfu);
+    void *access=get_provider(client);
+#else
     void *access=*(void **)((char *)client+0x7c);
+#endif
     if(!access) return 0xe00002d8u;
     void *provider=NULL;
     uint32_t size_slot=PHYSICAL_SIZE_SLOT,read_slot=PHYSICAL_READ_SLOT;
-#if NOR_MODE == 0
+#if NOR_MODE == 0 || NOR_MODE == 4
     provider=*(void **)((char *)access+0x50);
 #else
     if(*(uint8_t *)((char *)access+0x50)) provider=*(void **)((char *)access+0x54);

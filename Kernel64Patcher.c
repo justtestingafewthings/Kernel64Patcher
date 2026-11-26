@@ -14,6 +14,28 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__APPLE__) && defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && \
+    __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 1070
+/* Snow Leopard has no memmem in libSystem. */
+static void *legacy_memmem(const void *haystack, size_t length,
+                           const void *needle, size_t needle_length) {
+    const unsigned char *cursor = haystack;
+    const unsigned char *last;
+    if (!needle_length) return (void *)cursor;
+    if (needle_length > length) return NULL;
+    last = cursor + length - needle_length;
+    while (cursor <= last) {
+        cursor = memchr(cursor, *(const unsigned char *)needle,
+                        (size_t)(last - cursor) + 1);
+        if (!cursor) return NULL;
+        if (!memcmp(cursor, needle, needle_length)) return (void *)cursor;
+        ++cursor;
+    }
+    return NULL;
+}
+#define memmem legacy_memmem
+#endif
+
 #include "patches.h"
 #include "arm32.c"
 #include "dynamic.c"
